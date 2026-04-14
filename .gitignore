@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+*.so
+.ipynb_checkpoints/
+*.pkl
+*.pkl.gz
+*.pth
+*.pt
+data/
+results/
+*.log
+.DS_Store
+Thumbs.db
+scripts/*.sbatch
+scripts/run_experiments.py
+notebooks/GDGU_EV_loc_*.ipynb

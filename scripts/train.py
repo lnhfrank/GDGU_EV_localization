@@ -1,0 +1,280 @@
+#!/usr/bin/env python3
+"""Non-interactive training script for HPC batch jobs.
+
+Hyperparameters are loaded from config/<bus_system>.yaml (same as run_experiments.py).
+All outputs (CSV, JSON logs) are saved to results/<YYYY-MM-DD_HH>/.
+Visualization is handled separately via notebooks/Viz_GDGU_loc.ipynb.
+
+Usage:
+    python train.py --bus 34bus
+    python train.py --bus 123bus
+    python train.py --bus 34bus --backbone GCN --scenario S1 --seed 42
+"""
+
+import argparse
+import json
+import sys
+import time
+from datetime import datetime
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import torch
+import yaml
+
+# Project root = parent of scripts/
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+CONFIG_DIR = PROJECT_ROOT / 'config'
+
+sys.path.insert(0, str(PROJECT_ROOT))
+
+from src.data import load_evcs_data
+from src.experiment import run_single_trial
+from src.models import MODEL_CLASSES
+
+
+def load_experiment(bus_system: str, source_data: Path) -> dict:
+    """Load experiment definition from config/<bus_system>.yaml.
+
+    Same logic as run_experiments.py to guarantee parameter consistency.
+    """
+    cfg_path = CONFIG_DIR / f'{bus_system}.yaml'
+    if not cfg_path.exists():
+        raise FileNotFoundError(
+            f'Config not found: {cfg_path}\n'
+            f'Available configs: {list(CONFIG_DIR.glob("*.yaml"))}'
+        )
+    with open(cfg_path) as f:
+        cfg = yaml.safe_load(f)
+
+    d = cfg['data']
+    t = cfg['training']
+    g = cfg['gdgu']
+    gi = cfg.get('gif', {})
+    e = cfg['experiment']
+
+    # Resolve pkl_paths: support glob patterns (123-bus) and plain filenames
+    raw_paths = d['pkl_paths']
+    if '*' in raw_paths:
+        pkl_paths = sorted(str(p) for p in source_data.glob(raw_paths))
+    else:
+        pkl_paths = str(source_data / raw_paths)
+
+    return {
+        'pkl_paths':    pkl_paths,
+        'gml_path':     str(source_data / d['gml_path']),
+        'evcs_bus_ids': d['evcs_bus_ids'],
+        'config': {
+            # ── data split ──
+            'test_size':          t['test_size'],
+            'val_ratio':          t['val_ratio'],
+            # ── training ──
+            'epochs':             t['epochs'],
+            'batch_size':         t['batch_size'],
+            'lr':                 t['lr'],
+            'weight_decay':       t['weight_decay'],
+            'patience':           t['patience'],
+            'scheduler_patience': t.get('scheduler_patience', 20),
+            # ── model architecture ──
+            'hidden_dim':         t['hidden_dim'],
+            'n_layers':           t['n_layers'],
+            'dropout':            t['dropout'],
+            # ── gdgu ──
+            'gdgu_damp':          g['damp'],
+            'gdgu_max_norm':      g['max_norm'],
+            'gdgu_finetune':      g['finetune_epochs'],
+            'gdgu_finetune_lr':   g.get('finetune_lr', 1e-4),
+            # ── gif / idea ──
+            'gif_iteration':      gi.get('iteration', 50),
+            'gif_damp':           gi.get('damp', 0.01),
+            'gif_scale':          gi.get('scale', 50.0),
+            'idea_finetune':      gi.get('idea_finetune', 25),
+            'gif_max_batches':    gi.get('max_batches'),
+            # ── experiment ──
+            'seeds':              e['seeds'],
+            'backbones':          e['backbones'],
+        },
+    }
+
+
+def build_scenarios(evcs_bus_ids, evcs_buses, n_nodes):
+    """Build cumulative unlearning scenarios from EVCS bus list."""
+    scenarios = {}
+    for i in range(1, len(evcs_bus_ids) + 1):
+        forget_buses = evcs_bus_ids[:i]
+        names_str = '+'.join(str(b) for b in forget_buses)
+        pct = len(forget_buses) / n_nodes * 100
+        s = len(forget_buses)
+        scenarios[f'S{i}'] = {
+            'label': f'S{i}: Bus {names_str} ({s} node{"s" if s > 1 else ""}, {pct:.1f}%)',
+            'forget_indices': [evcs_buses[b] for b in forget_buses],
+            'forget_label_indices': list(range(i)),
+        }
+    return scenarios
+
+
+def save_results(results_all, all_logs, bus_system, data, config,
+                 scenarios, backbones, output_dir, device, tag):
+    """Save CSV + JSON results to output_dir."""
+    df = pd.DataFrame(results_all)
+
+    # ── Raw CSV ──
+    raw_csv = output_dir / f'{tag}_results_raw.csv'
+    df.to_csv(raw_csv, index=False)
+    print(f'Raw results saved to {raw_csv}  ({len(df)} rows)')
+
+    # ── Summary CSV ──
+    roc_cols = sorted([c for c in df.columns if c.startswith('ROC_EVCS')])
+    f1_cols = sorted([c for c in df.columns if c.startswith('F1_EVCS')])
+    metric_cols = ['ExMatch', 'Hamming_Acc', 'Macro_ROC', 'Macro_F1'] \
+                + roc_cols + f1_cols + ['MIA_AUC', 'Time', 'Peak_Memory_MB']
+    summary = df.groupby(['Backbone', 'Scenario', 'Method'])[metric_cols].agg(['mean', 'std']).round(4)
+    sum_csv = output_dir / f'{tag}_results_summary.csv'
+    summary.to_csv(sum_csv)
+    print(f'Summary saved to {sum_csv}')
+
+    # ── Epoch logs JSON (with metadata, same format as run_experiments.py) ──
+    meta = {
+        'bus_system': bus_system,
+        'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+        'device': str(device),
+        'data': {
+            'n_graphs': int(data['n_graphs']),
+            'n_nodes': int(data['n_nodes']),
+            'n_feat': int(data['n_feat']),
+            'n_edges': int(data['edge_index'].shape[1]),
+            'n_evcs': int(data['n_evcs']),
+        },
+        'config': {k: v for k, v in config.items()},
+        'model_params': {},
+        'scenarios': {k: v['label'] for k, v in scenarios.items()},
+    }
+    for name in backbones:
+        m = MODEL_CLASSES[name](in_dim=data['n_feat'], hid_dim=config['hidden_dim'],
+                                out_dim=config['out_dim'], n_layers=config['n_layers'],
+                                dropout=config['dropout'])
+        meta['model_params'][name] = sum(p.numel() for p in m.parameters())
+
+    log_out = {'_metadata': meta, **all_logs}
+    log_json = output_dir / f'{tag}_epoch_logs.json'
+    with open(log_json, 'w') as f:
+        json.dump(log_out, f, indent=2)
+    print(f'Epoch logs saved to {log_json}')
+
+    # ── Print summary table ──
+    for bb in backbones:
+        print(f'\n{"─"*80}\n  Backbone: {bb}\n{"─"*80}')
+        for scen in scenarios:
+            print(f'\n  {scen}:')
+            for method in ['Original', 'GDGU', 'GIF', 'IDEA', 'Retrain']:
+                sub = df[(df.Backbone == bb) & (df.Scenario == scen) & (df.Method == method)]
+                if len(sub) == 0:
+                    continue
+                em = f"{sub['ExMatch'].mean():.3f}\u00b1{sub['ExMatch'].std():.3f}"
+                mr = f"{sub['Macro_ROC'].mean():.3f}\u00b1{sub['Macro_ROC'].std():.3f}"
+                mf = f"{sub['Macro_F1'].mean():.3f}\u00b1{sub['Macro_F1'].std():.3f}"
+                mia = f"{sub['MIA_AUC'].mean():.3f}" if sub['MIA_AUC'].notna().any() else '\u2014'
+                t = f"{sub['Time'].mean():.1f}s"
+                print(f'    {method:10s}  ExMatch={em}  MacroROC={mr}  MacroF1={mf}  MIA={mia}  Time={t}')
+
+    return df
+
+
+def main():
+    parser = argparse.ArgumentParser(description='GDGU EVCS Localization Training')
+    parser.add_argument('--bus', type=str, required=True, choices=['34bus', '123bus'],
+                        help='Bus system to run')
+    parser.add_argument('--backbone', type=str, default=None,
+                        help='Single backbone to run (GCN/GAT/GIN). Default: all three')
+    parser.add_argument('--scenario', type=str, default=None,
+                        help='Single scenario to run (S1/S2/...). Default: all')
+    parser.add_argument('--seed', type=int, default=None,
+                        help='Single seed to run. Default: all seeds from config')
+    parser.add_argument('--data-dir', type=str, default=None,
+                        help='Override source data directory')
+    parser.add_argument('--gpu', type=int, default=1,
+                        help='GPU device index (default: 1)')
+    args = parser.parse_args()
+
+    # Device
+    device = torch.device(f'cuda:{args.gpu}' if torch.cuda.is_available() else 'cpu')
+    print(f'Device: {device}')
+    if device.type == 'cuda':
+        print(f'GPU   : {torch.cuda.get_device_properties(device).name}')
+
+    # Paths
+    bus_system = args.bus
+    if args.data_dir:
+        source_data = Path(args.data_dir)
+    else:
+        source_data = PROJECT_ROOT.parent / 'Source' / 'PB_data' / '3_EVCS Attacks'
+
+    # Load config from YAML (same as run_experiments.py)
+    exp = load_experiment(bus_system, source_data)
+    config = exp['config']
+
+    # Single output directory — everything goes here
+    today = datetime.now().strftime('%Y-%m-%d_%H')
+    output_dir = PROJECT_ROOT / 'results' / today
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    print(f'Bus    : {bus_system}')
+    print(f'Config : {CONFIG_DIR / f"{bus_system}.yaml"}')
+    print(f'Output : {output_dir}')
+
+    # Load data
+    data = load_evcs_data(exp['pkl_paths'], exp['gml_path'], bus_system=bus_system)
+    config['out_dim'] = data['n_evcs']
+
+    # Scenarios
+    scenarios = build_scenarios(exp['evcs_bus_ids'], data['evcs_buses'], data['n_nodes'])
+
+    # Filter by CLI args
+    backbones = [args.backbone] if args.backbone else config['backbones']
+    seeds = [args.seed] if args.seed else config['seeds']
+    scen_filter = {args.scenario: scenarios[args.scenario]} if args.scenario else scenarios
+
+    # Run
+    results_all = []
+    all_logs = {}
+    total = len(backbones) * len(scen_filter) * len(seeds)
+    count = 0
+    t_start = time.time()
+
+    for backbone in backbones:
+        for scen_key, scen_val in scen_filter.items():
+            for seed in seeds:
+                count += 1
+                print(f'\n[{count}/{total}]')
+                trial_results, trial_logs = run_single_trial(
+                    backbone, scen_key, scen_val, seed,
+                    data['all_x'], data['all_y'], data['edge_index'],
+                    config, device)
+                results_all.extend(trial_results)
+                all_logs[f'{backbone}_{scen_key}_{seed}'] = trial_logs
+                print(f'  Finished at {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}')
+
+    elapsed = time.time() - t_start
+    print(f'\n{"="*70}')
+    print(f'All {total} runs completed in {elapsed:.1f}s ({elapsed/60:.1f}min)')
+    print(f'Finished at {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}')
+    print(f'{"="*70}')
+
+    # Tag for partial runs
+    tag = bus_system
+    if args.backbone:
+        tag += f'_{args.backbone}'
+    if args.scenario:
+        tag += f'_{args.scenario}'
+
+    # Save all outputs to the single date folder
+    save_results(results_all, all_logs, bus_system, data, config,
+                 scen_filter, backbones, output_dir, device, tag)
+
+    print(f'\nAll outputs in: {output_dir}')
+    print(f'Visualize via:  notebooks/Viz_GDGU_loc.ipynb')
+
+
+if __name__ == '__main__':
+    main()

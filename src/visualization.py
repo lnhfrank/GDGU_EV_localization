@@ -1,0 +1,514 @@
+"""Visualization functions for GDGU/GIF/IDEA localization experiments.
+
+All style constants are grouped at the top for easy customization.
+Call `apply_style()` once before plotting to set Times New Roman globally.
+"""
+
+import os
+import numpy as np
+import pandas as pd
+import matplotlib as mpl
+import matplotlib.pyplot as plt
+
+# ============================================================
+#  Style defaults — override via apply_style(overrides={...})
+# ============================================================
+STYLE = {
+    # Font
+    'font_family':   'Times New Roman',
+    'fs_label':      26,
+    'fs_tick':       24,
+    'fs_legend':     20,
+    'fs_subtitle':   22,
+    'fs_annotation': 18,
+
+    # Colors — 5 methods
+    'colors': {
+        'Original': '#2196F3',
+        'GDGU':     '#FF9800',
+        'GIF':      '#9C27B0',
+        'IDEA':     '#E91E63',
+        'Retrain':  '#4CAF50',
+    },
+    'markers': {
+        'Original': 'o',
+        'GDGU':     's',
+        'GIF':      'D',
+        'IDEA':     'P',
+        'Retrain':  '^',
+    },
+    'ideal_line_color': 'red',
+    'grid_alpha':       0.3,
+    'bar_alpha':        0.85,
+    'bar_edge_color':   'black',
+    'bar_edge_width':   0.5,
+    'fill_alpha':       0.15,
+
+    # Save
+    'save_fmt': 'pdf',
+    'save_dpi': 300,
+}
+
+METHODS_ORDER = ['Original', 'GDGU', 'GIF', 'IDEA', 'Retrain']
+GU_METHODS = ['GDGU', 'GIF', 'IDEA']
+
+
+def apply_style(overrides=None):
+    """Apply matplotlib rcParams for Times New Roman. Call once before plotting.
+
+    Args:
+        overrides: dict to merge into STYLE, e.g. {'fs_label': 24, 'save_fmt': 'png'}.
+    """
+    if overrides:
+        for k, v in overrides.items():
+            if isinstance(v, dict) and isinstance(STYLE.get(k), dict):
+                STYLE[k].update(v)
+            else:
+                STYLE[k] = v
+
+    font = STYLE['font_family']
+    mpl.rcParams.update({
+        'font.family':      'serif',
+        'font.serif':       [font],
+        'mathtext.fontset':  'custom',
+        'mathtext.rm':       font,
+        'mathtext.it':       f'{font}:italic',
+        'mathtext.bf':       f'{font}:bold',
+    })
+
+
+# ============================================================
+#  Data loading
+# ============================================================
+def load_results(results_dir, bus_system='123bus'):
+    """Load raw CSV from a date-named results folder.
+
+    Args:
+        results_dir: path to date folder, e.g. '.../results/2026-04-07'.
+        bus_system:  '34bus' or '123bus'.
+
+    Returns:
+        df, scenarios, backbones
+    """
+    csv_path = os.path.join(results_dir, f'{bus_system}_results_raw.csv')
+    df = pd.read_csv(csv_path)
+
+    scen_keys = sorted(df.Scenario.unique(), key=lambda s: int(s[1:]))
+    scenarios = {sk: {'label': sk} for sk in scen_keys}
+    backbones = sorted(df.Backbone.unique())
+
+    print(f'Loaded {len(df)} rows from {csv_path}')
+    print(f'  Backbones : {backbones}')
+    print(f'  Scenarios : {scen_keys}')
+    print(f'  Methods   : {sorted(df.Method.unique())}')
+    return df, scenarios, backbones
+
+
+# ============================================================
+#  Internal helpers
+# ============================================================
+def _savefig(fig, filepath):
+    fig.savefig(filepath, bbox_inches='tight', dpi=STYLE['save_dpi'])
+
+
+def _scen_labels(scenarios):
+    return [scenarios[s]['label'].split(':')[0] for s in scenarios]
+
+
+def _available_methods(df):
+    """Return methods present in df, in METHODS_ORDER order."""
+    present = set(df.Method.unique())
+    return [m for m in METHODS_ORDER if m in present]
+
+
+# ============================================================
+#  Plot functions
+# ============================================================
+def plot_metric_bars(df, metric_col, ylabel, ylim, filepath,
+                     scenarios, backbones):
+    """Grouped bar chart (1x3 subplots, one per backbone)."""
+    S = STYLE
+    methods = _available_methods(df)
+    n_methods = len(methods)
+    width = 0.8 / n_methods
+
+    fig, axes = plt.subplots(1, len(backbones), figsize=(18, 5), sharey=True)
+    scen_keys = list(scenarios.keys())
+    labels = _scen_labels(scenarios)
+    for ax_idx, bb in enumerate(backbones):
+        ax = axes[ax_idx]
+        x = np.arange(len(scen_keys))
+        for m_idx, method in enumerate(methods):
+            offset = (m_idx - (n_methods - 1) / 2) * width
+            means, stds = [], []
+            for sk in scen_keys:
+                sub = df[(df.Backbone == bb) & (df.Scenario == sk) & (df.Method == method)]
+                means.append(sub[metric_col].mean())
+                stds.append(sub[metric_col].std())
+            ax.bar(x + offset, means, width, yerr=stds,
+                   label=method, color=S['colors'][method], alpha=S['bar_alpha'],
+                   capsize=3, edgecolor=S['bar_edge_color'], linewidth=S['bar_edge_width'])
+        ax.set_title(bb, fontsize=S['fs_subtitle'], fontweight='bold')
+        ax.set_xticks(x)
+        ax.set_xticklabels(labels, fontsize=S['fs_tick'])
+        ax.tick_params(axis='y', labelsize=S['fs_tick'])
+        if ax_idx == 0:
+            ax.set_ylabel(ylabel, fontsize=S['fs_label'])
+        ax.set_ylim(ylim)
+        ax.grid(axis='y', alpha=S['grid_alpha'])
+    axes[-1].legend(fontsize=S['fs_legend'])
+    plt.tight_layout()
+    _savefig(fig, filepath)
+    plt.show()
+
+
+def plot_metric_lines(df, metric_col, ylabel, ylim, filepath,
+                      scenarios, backbones):
+    """Line chart with shaded std (1x3 subplots, one per backbone)."""
+    S = STYLE
+    methods = _available_methods(df)
+    fig, axes = plt.subplots(1, len(backbones), figsize=(18, 5), sharey=True)
+    scen_keys = list(scenarios.keys())
+    labels = _scen_labels(scenarios)
+    x = np.arange(len(scen_keys))
+    for ax_idx, bb in enumerate(backbones):
+        ax = axes[ax_idx]
+        for method in methods:
+            means, stds = [], []
+            for sk in scen_keys:
+                sub = df[(df.Backbone == bb) & (df.Scenario == sk) & (df.Method == method)]
+                means.append(sub[metric_col].mean())
+                stds.append(sub[metric_col].std())
+            means, stds = np.array(means), np.array(stds)
+            ax.plot(x, means, marker=S['markers'][method], color=S['colors'][method],
+                    label=method, linewidth=2, markersize=8)
+            ax.fill_between(x, means - stds, means + stds,
+                            color=S['colors'][method], alpha=S['fill_alpha'])
+        ax.set_title(bb, fontsize=S['fs_subtitle'], fontweight='bold')
+        ax.set_xticks(x)
+        ax.set_xticklabels(labels, fontsize=S['fs_tick'])
+        ax.tick_params(axis='y', labelsize=S['fs_tick'])
+        ax.set_xlabel('Scenario', fontsize=S['fs_label'])
+        if ax_idx == 0:
+            ax.set_ylabel(ylabel, fontsize=S['fs_label'])
+        ax.set_ylim(ylim)
+        ax.grid(True, alpha=S['grid_alpha'])
+    axes[-1].legend(fontsize=S['fs_legend'])
+    plt.tight_layout()
+    _savefig(fig, filepath)
+    plt.show()
+
+
+def plot_per_evcs_roc(df, filepath, scenarios, backbones, evcs_names=None):
+    """backbone (row) x EVCS (col) grid, grouped bars per scenario."""
+    S = STYLE
+    methods = _available_methods(df)
+    n_methods = len(methods)
+    width = 0.8 / n_methods
+
+    roc_cols = sorted([c for c in df.columns if c.startswith('ROC_EVCS')])
+    n_evcs = len(roc_cols)
+    n_bb = len(backbones)
+
+    if evcs_names is None:
+        evcs_names = [f'EVCS {i+1}' for i in range(n_evcs)]
+
+    scen_keys = list(scenarios.keys())
+    labels = _scen_labels(scenarios)
+    fig, axes = plt.subplots(n_bb, n_evcs, figsize=(6 * n_evcs, 5 * n_bb), sharey=True)
+    if n_bb == 1:
+        axes = [axes]
+    if n_evcs == 1:
+        axes = [[ax] for ax in axes]
+
+    for row, bb in enumerate(backbones):
+        for col, (roc_col, evcs_name) in enumerate(zip(roc_cols, evcs_names)):
+            ax = axes[row][col]
+            x = np.arange(len(scen_keys))
+            for m_idx, method in enumerate(methods):
+                offset = (m_idx - (n_methods - 1) / 2) * width
+                means, stds = [], []
+                for sk in scen_keys:
+                    sub = df[(df.Backbone == bb) & (df.Scenario == sk) & (df.Method == method)]
+                    means.append(sub[roc_col].mean())
+                    stds.append(sub[roc_col].std())
+                ax.bar(x + offset, means, width, yerr=stds,
+                       label=method, color=S['colors'][method], alpha=S['bar_alpha'],
+                       capsize=3, edgecolor=S['bar_edge_color'], linewidth=S['bar_edge_width'])
+            if row == 0:
+                ax.set_title(evcs_name, fontsize=S['fs_subtitle'] - 2, fontweight='bold')
+            ax.set_xticks(x)
+            ax.set_xticklabels(labels, fontsize=S['fs_tick'] - 2)
+            ax.tick_params(axis='y', labelsize=S['fs_tick'] - 2)
+            if col == 0:
+                ax.set_ylabel(f'{bb}\nROC-AUC', fontsize=S['fs_label'] - 2)
+            ax.set_ylim(0.4, 1.0)
+            ax.grid(axis='y', alpha=S['grid_alpha'])
+            if row == 0 and col == n_evcs - 1:
+                ax.legend(fontsize=S['fs_legend'] - 2)
+    plt.tight_layout()
+    _savefig(fig, filepath)
+    plt.show()
+
+
+def plot_mia_auc(df, filepath, scenarios, backbones):
+    """MIA-AUC bar chart (all GU methods + Retrain) with ideal=0.5 line."""
+    S = STYLE
+    mia_methods = [m for m in ['GDGU', 'GIF', 'IDEA', 'Retrain']
+                   if m in df.Method.unique()]
+    n_methods = len(mia_methods)
+    width = 0.8 / n_methods
+
+    fig, axes = plt.subplots(1, len(backbones), figsize=(18, 5), sharey=True)
+    scen_keys = list(scenarios.keys())
+    labels = _scen_labels(scenarios)
+
+    for ax_idx, bb in enumerate(backbones):
+        ax = axes[ax_idx]
+        x = np.arange(len(scen_keys))
+        for m_idx, method in enumerate(mia_methods):
+            offset = (m_idx - (n_methods - 1) / 2) * width
+            means, stds = [], []
+            for sk in scen_keys:
+                sub = df[(df.Backbone == bb) & (df.Scenario == sk) & (df.Method == method)]
+                means.append(sub['MIA_AUC'].mean())
+                stds.append(sub['MIA_AUC'].std())
+            ax.bar(x + offset, means, width, yerr=stds,
+                   label=method, color=S['colors'][method], alpha=S['bar_alpha'],
+                   capsize=3, edgecolor=S['bar_edge_color'], linewidth=S['bar_edge_width'])
+        ax.axhline(y=0.5, color=S['ideal_line_color'], linestyle='--', alpha=0.7,
+                   label='Ideal (0.5)')
+        ax.set_title(bb, fontsize=S['fs_subtitle'], fontweight='bold')
+        ax.set_xticks(x)
+        ax.set_xticklabels(labels, fontsize=S['fs_tick'])
+        ax.tick_params(axis='y', labelsize=S['fs_tick'])
+        if ax_idx == 0:
+            ax.set_ylabel('MIA-AUC', fontsize=S['fs_label'])
+        ax.set_ylim(0.0, 1.0)
+        ax.grid(axis='y', alpha=S['grid_alpha'])
+    axes[-1].legend(fontsize=S['fs_legend'])
+    plt.tight_layout()
+    _savefig(fig, filepath)
+    plt.show()
+
+
+def plot_time_comparison(df, filepath, scenarios, backbones):
+    """Time bar chart for all GU methods + Retrain, with speedup annotations."""
+    S = STYLE
+    gu_methods = [m for m in ['GDGU', 'GIF', 'IDEA', 'Retrain']
+                  if m in df.Method.unique()]
+    n_methods = len(gu_methods)
+    width = 0.8 / n_methods
+
+    fig, ax = plt.subplots(figsize=(14, 7))
+    scen_keys = list(scenarios.keys())
+
+    groups = []
+    for bb in backbones:
+        for sk in scen_keys:
+            groups.append(f'{bb}\n{sk}')
+
+    x = np.arange(len(groups))
+    for m_idx, method in enumerate(gu_methods):
+        offset = (m_idx - (n_methods - 1) / 2) * width
+        means = []
+        for bb in backbones:
+            for sk in scen_keys:
+                sub = df[(df.Backbone == bb) & (df.Scenario == sk) & (df.Method == method)]
+                means.append(sub['Time'].mean())
+        ax.bar(x + offset, means, width,
+               label=method, color=S['colors'][method],
+               edgecolor=S['bar_edge_color'], linewidth=S['bar_edge_width'])
+
+    ax.set_xticks(x)
+    ax.set_xticklabels(groups, fontsize=S['fs_tick'] - 4)
+    ax.tick_params(axis='y', labelsize=S['fs_tick'])
+    ax.set_ylabel('Time (seconds)', fontsize=S['fs_label'])
+    ax.legend(fontsize=S['fs_legend'])
+    ax.grid(axis='y', alpha=S['grid_alpha'])
+    plt.tight_layout()
+    _savefig(fig, filepath)
+    plt.show()
+
+
+def plot_memory_usage(df, filepath, scenarios, backbones):
+    """Peak GPU memory bar chart, one group per backbone x scenario."""
+    S = STYLE
+    if 'Peak_Memory_MB' not in df.columns:
+        print('  [skip] Peak_Memory_MB column not found — skipping memory plot')
+        return
+
+    methods = _available_methods(df)
+    n_methods = len(methods)
+    width = 0.8 / n_methods
+
+    fig, axes = plt.subplots(1, len(backbones), figsize=(18, 5), sharey=True)
+    if len(backbones) == 1:
+        axes = [axes]
+    scen_keys = list(scenarios.keys())
+    labels = _scen_labels(scenarios)
+
+    for ax_idx, bb in enumerate(backbones):
+        ax = axes[ax_idx]
+        x = np.arange(len(scen_keys))
+        for m_idx, method in enumerate(methods):
+            offset = (m_idx - (n_methods - 1) / 2) * width
+            means, stds = [], []
+            for sk in scen_keys:
+                sub = df[(df.Backbone == bb) & (df.Scenario == sk) & (df.Method == method)]
+                means.append(sub['Peak_Memory_MB'].mean())
+                stds.append(sub['Peak_Memory_MB'].std())
+            ax.bar(x + offset, means, width, yerr=stds,
+                   label=method, color=S['colors'][method], alpha=S['bar_alpha'],
+                   capsize=3, edgecolor=S['bar_edge_color'], linewidth=S['bar_edge_width'])
+        ax.set_title(bb, fontsize=S['fs_subtitle'], fontweight='bold')
+        ax.set_xticks(x)
+        ax.set_xticklabels(labels, fontsize=S['fs_tick'])
+        ax.tick_params(axis='y', labelsize=S['fs_tick'])
+        if ax_idx == 0:
+            ax.set_ylabel('Peak Memory (MB)', fontsize=S['fs_label'])
+        ax.grid(axis='y', alpha=S['grid_alpha'])
+    axes[-1].legend(fontsize=S['fs_legend'])
+    plt.tight_layout()
+    _savefig(fig, filepath)
+    plt.show()
+
+
+def plot_f1_vs_mia(df, filepath, scenarios, backbones):
+    """Forgetting-Reasoning trade-off scatter: Macro F1 (y) vs MIA-AUC (x).
+
+    One subplot per backbone. Each point = one scenario (mean over seeds).
+    All GU methods + Retrain shown. Ideal: MIA close to 0.5, F1 high.
+    """
+    S = STYLE
+    mia_methods = [m for m in ['GDGU', 'GIF', 'IDEA', 'Retrain']
+                   if m in df.Method.unique()]
+    scen_keys = list(scenarios.keys())
+
+    fig, axes = plt.subplots(1, len(backbones), figsize=(7 * len(backbones), 5.5),
+                             sharey=True, sharex=True)
+    if len(backbones) == 1:
+        axes = [axes]
+
+    for ax_idx, bb in enumerate(backbones):
+        ax = axes[ax_idx]
+        for method in mia_methods:
+            mia_means, f1_means = [], []
+            for sk in scen_keys:
+                sub = df[(df.Backbone == bb) & (df.Scenario == sk) & (df.Method == method)]
+                mia_means.append(sub['MIA_AUC'].mean())
+                f1_means.append(sub['Macro_F1'].mean())
+            ax.scatter(mia_means, f1_means,
+                       color=S['colors'][method], marker=S['markers'][method],
+                       s=120, edgecolors='black', linewidths=0.6,
+                       label=method, zorder=3)
+            for i, sk in enumerate(scen_keys):
+                ax.annotate(scenarios[sk]['label'].split(':')[0],
+                            (mia_means[i], f1_means[i]),
+                            textcoords='offset points', xytext=(6, 4),
+                            fontsize=S['fs_annotation'], fontweight='bold')
+
+        ax.axvline(x=0.5, color=S['ideal_line_color'], linestyle='--', alpha=0.6,
+                   label='Ideal MIA (0.5)')
+        ax.set_title(bb, fontsize=S['fs_subtitle'], fontweight='bold')
+        ax.set_xlabel('MIA-AUC', fontsize=S['fs_label'])
+        ax.tick_params(axis='both', labelsize=S['fs_tick'])
+        if ax_idx == 0:
+            ax.set_ylabel('Macro F1', fontsize=S['fs_label'])
+        ax.grid(True, alpha=S['grid_alpha'])
+    axes[-1].legend(fontsize=S['fs_legend'], loc='best')
+    plt.tight_layout()
+    _savefig(fig, filepath)
+    plt.show()
+
+
+def plot_gu_comparison(df, filepath, scenarios, backbones):
+    """GU method comparison: GDGU vs GIF vs IDEA across scenarios.
+
+    One subplot per backbone. Lines for each GU method + dashed Retrain
+    as gold-standard reference. Y-axis = Macro ROC-AUC.
+    """
+    S = STYLE
+    gu_plus = [m for m in ['GDGU', 'GIF', 'IDEA', 'Retrain']
+               if m in df.Method.unique()]
+    scen_keys = list(scenarios.keys())
+    labels = _scen_labels(scenarios)
+    x = np.arange(len(scen_keys))
+
+    fig, axes = plt.subplots(1, len(backbones), figsize=(7 * len(backbones), 5.5),
+                             sharey=True)
+    if len(backbones) == 1:
+        axes = [axes]
+
+    for ax_idx, bb in enumerate(backbones):
+        ax = axes[ax_idx]
+        for method in gu_plus:
+            means, stds = [], []
+            for sk in scen_keys:
+                sub = df[(df.Backbone == bb) & (df.Scenario == sk) & (df.Method == method)]
+                means.append(sub['Macro_ROC'].mean())
+                stds.append(sub['Macro_ROC'].std())
+            means, stds = np.array(means), np.array(stds)
+            ls = '--' if method == 'Retrain' else '-'
+            lw = 1.5 if method == 'Retrain' else 2.5
+            ax.plot(x, means, marker=S['markers'][method], color=S['colors'][method],
+                    label=method, linewidth=lw, linestyle=ls, markersize=9)
+            ax.fill_between(x, means - stds, means + stds,
+                            color=S['colors'][method], alpha=S['fill_alpha'])
+
+        ax.set_title(bb, fontsize=S['fs_subtitle'], fontweight='bold')
+        ax.set_xticks(x)
+        ax.set_xticklabels(labels, fontsize=S['fs_tick'])
+        ax.tick_params(axis='y', labelsize=S['fs_tick'])
+        ax.set_xlabel('Scenario', fontsize=S['fs_label'])
+        if ax_idx == 0:
+            ax.set_ylabel('Macro ROC-AUC', fontsize=S['fs_label'])
+        ax.set_ylim(0.4, 1.0)
+        ax.grid(True, alpha=S['grid_alpha'])
+    axes[-1].legend(fontsize=S['fs_legend'], loc='best')
+    plt.suptitle('GU Method Comparison', fontsize=S['fs_label'] + 2, fontweight='bold', y=1.02)
+    plt.tight_layout()
+    _savefig(fig, filepath)
+    plt.show()
+
+
+# ============================================================
+#  Convenience: generate all figures at once
+# ============================================================
+def plot_all(df, output_dir, scenarios, backbones, bus_system='34bus'):
+    """Generate all standard figures and save to output_dir.
+
+    Args:
+        df:         DataFrame (raw results or loaded via load_results).
+        output_dir: directory to save figures into.
+        scenarios:  dict, e.g. {'S1': {'label': 'S1'}, ...}.
+        backbones:  list, e.g. ['GCN', 'GAT', 'GIN'].
+        bus_system: '34bus' or '123bus', used as filename prefix.
+    """
+    os.makedirs(output_dir, exist_ok=True)
+    j = lambda name: os.path.join(output_dir, f'{bus_system}_{name}.{STYLE["save_fmt"]}')
+
+    plot_metric_bars(df, 'ExMatch', 'Exact Match Accuracy', (0.0, 1.0),
+                     j('ExMatch_comparison'), scenarios, backbones)
+    plot_metric_lines(df, 'ExMatch', 'Exact Match Accuracy', (0.0, 1.0),
+                      j('ExMatch_trend'), scenarios, backbones)
+    plot_metric_bars(df, 'Macro_ROC', 'Macro ROC-AUC', (0.4, 1.0),
+                     j('MacroROC_comparison'), scenarios, backbones)
+    plot_metric_lines(df, 'Macro_ROC', 'Macro ROC-AUC', (0.4, 1.0),
+                      j('MacroROC_trend'), scenarios, backbones)
+    plot_metric_bars(df, 'Macro_F1', 'Macro F1', (0.0, 1.0),
+                     j('MacroF1_comparison'), scenarios, backbones)
+    plot_metric_lines(df, 'Macro_F1', 'Macro F1', (0.0, 1.0),
+                      j('MacroF1_trend'), scenarios, backbones)
+    plot_metric_bars(df, 'Hamming_Acc', 'Hamming Accuracy', (0.4, 1.0),
+                     j('HammingAcc_comparison'), scenarios, backbones)
+    plot_metric_lines(df, 'Hamming_Acc', 'Hamming Accuracy', (0.4, 1.0),
+                      j('HammingAcc_trend'), scenarios, backbones)
+    plot_per_evcs_roc(df, j('PerEVCS_ROC_breakdown'), scenarios, backbones)
+    plot_mia_auc(df, j('MIA_AUC_comparison'), scenarios, backbones)
+    plot_f1_vs_mia(df, j('F1_vs_MIA_tradeoff'), scenarios, backbones)
+    plot_time_comparison(df, j('Time_comparison'), scenarios, backbones)
+    plot_memory_usage(df, j('Memory_usage'), scenarios, backbones)
+    plot_gu_comparison(df, j('GU_method_comparison'), scenarios, backbones)
+
+    print(f"\nAll figures saved to {output_dir}/ (prefix: {bus_system}_)")
