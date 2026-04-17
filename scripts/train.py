@@ -29,7 +29,7 @@ CONFIG_DIR = PROJECT_ROOT / 'config'
 
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from src.data import load_evcs_data
+from src.data import load_evcs_data, expand_forget_khop
 from src.experiment import run_single_trial
 from src.models import MODEL_CLASSES
 
@@ -94,23 +94,46 @@ def load_experiment(bus_system: str, source_data: Path) -> dict:
             # ── experiment ──
             'seeds':              e['seeds'],
             'backbones':          e['backbones'],
+            'k_hops':             e.get('k_hops', [0]),
         },
     }
 
 
-def build_scenarios(evcs_bus_ids, evcs_buses, n_nodes):
-    """Build cumulative unlearning scenarios from EVCS bus list."""
+def build_scenarios(evcs_bus_ids, evcs_buses, n_nodes, edge_index, k_hops=None):
+    """Build cumulative unlearning scenarios with k-hop neighbor expansion.
+
+    Naming: S{n}-{k}, e.g. S1-0 (EVCS only), S1-1 (+1-hop neighbors), S1-2 (+2-hop).
+
+    Args:
+        evcs_bus_ids: list of EVCS bus IDs in cumulative forget order.
+        evcs_buses:   dict {bus_id: node_index}.
+        n_nodes:      total number of nodes in the graph.
+        edge_index:   [2, E] tensor for topology.
+        k_hops:       list of k values, e.g. [0, 1, 2]. Defaults to [0].
+    """
+    if k_hops is None:
+        k_hops = [0]
+
     scenarios = {}
     for i in range(1, len(evcs_bus_ids) + 1):
         forget_buses = evcs_bus_ids[:i]
+        evcs_indices = [evcs_buses[b] for b in forget_buses]
         names_str = '+'.join(str(b) for b in forget_buses)
-        pct = len(forget_buses) / n_nodes * 100
-        s = len(forget_buses)
-        scenarios[f'S{i}'] = {
-            'label': f'S{i}: Bus {names_str} ({s} node{"s" if s > 1 else ""}, {pct:.1f}%)',
-            'forget_indices': [evcs_buses[b] for b in forget_buses],
-            'forget_label_indices': list(range(i)),
-        }
+
+        for k in k_hops:
+            expanded = expand_forget_khop(evcs_indices, edge_index, k=k)
+            n_forget = len(expanded)
+            pct = n_forget / n_nodes * 100
+            scen_key = f'S{i}-{k}'
+            scenarios[scen_key] = {
+                'label': f'S{i}-{k}: Bus {names_str} '
+                         f'(k={k}, {n_forget} node{"s" if n_forget > 1 else ""}, {pct:.1f}%)',
+                'forget_indices': expanded,
+                'forget_label_indices': list(range(i)),
+                'evcs_indices': evcs_indices,
+                'k_hop': k,
+                'n_evcs_forget': i,
+            }
     return scenarios
 
 
@@ -128,7 +151,9 @@ def save_results(results_all, all_logs, bus_system, data, config,
     roc_cols = sorted([c for c in df.columns if c.startswith('ROC_EVCS')])
     f1_cols = sorted([c for c in df.columns if c.startswith('F1_EVCS')])
     metric_cols = ['ExMatch', 'Hamming_Acc', 'Macro_ROC', 'Macro_F1'] \
-                + roc_cols + f1_cols + ['MIA_AUC', 'Time', 'Peak_Memory_MB']
+                + roc_cols + f1_cols \
+                + ['F1_forget', 'F1_retain', 'ROC_forget', 'ROC_retain'] \
+                + ['MIA_forget', 'MIA_retain', 'MIA_AUC', 'Time', 'Peak_Memory_MB']
     summary = df.groupby(['Backbone', 'Scenario', 'Method'])[metric_cols].agg(['mean', 'std']).round(4)
     sum_csv = output_dir / f'{tag}_results_summary.csv'
     summary.to_csv(sum_csv)
@@ -174,9 +199,11 @@ def save_results(results_all, all_logs, bus_system, data, config,
                 em = f"{sub['ExMatch'].mean():.3f}\u00b1{sub['ExMatch'].std():.3f}"
                 mr = f"{sub['Macro_ROC'].mean():.3f}\u00b1{sub['Macro_ROC'].std():.3f}"
                 mf = f"{sub['Macro_F1'].mean():.3f}\u00b1{sub['Macro_F1'].std():.3f}"
-                mia = f"{sub['MIA_AUC'].mean():.3f}" if sub['MIA_AUC'].notna().any() else '\u2014'
+                mia_f = f"{sub['MIA_forget'].mean():.3f}" if sub['MIA_forget'].notna().any() else '\u2014'
+                mia_r = f"{sub['MIA_retain'].mean():.3f}" if sub['MIA_retain'].notna().any() else '\u2014'
                 t = f"{sub['Time'].mean():.1f}s"
-                print(f'    {method:10s}  ExMatch={em}  MacroROC={mr}  MacroF1={mf}  MIA={mia}  Time={t}')
+                print(f'    {method:10s}  ExMatch={em}  MacroROC={mr}  MacroF1={mf}  '
+                      f'MIA_f={mia_f}  MIA_r={mia_r}  Time={t}')
 
     return df
 
@@ -188,7 +215,9 @@ def main():
     parser.add_argument('--backbone', type=str, default=None,
                         help='Single backbone to run (GCN/GAT/GIN). Default: all three')
     parser.add_argument('--scenario', type=str, default=None,
-                        help='Single scenario to run (S1/S2/...). Default: all')
+                        help='Single scenario to run (S1-0/S2-1/...). Default: all')
+    parser.add_argument('--khop', type=int, default=None,
+                        help='Single k-hop value to run (0/1/2). Default: all from config')
     parser.add_argument('--seed', type=int, default=None,
                         help='Single seed to run. Default: all seeds from config')
     parser.add_argument('--data-dir', type=str, default=None,
@@ -227,8 +256,17 @@ def main():
     data = load_evcs_data(exp['pkl_paths'], exp['gml_path'], bus_system=bus_system)
     config['out_dim'] = data['n_evcs']
 
-    # Scenarios
-    scenarios = build_scenarios(exp['evcs_bus_ids'], data['evcs_buses'], data['n_nodes'])
+    # k-hop values: CLI override or config
+    k_hops = [args.khop] if args.khop is not None else config.get('k_hops', [0])
+
+    # Scenarios (with k-hop expansion)
+    scenarios = build_scenarios(exp['evcs_bus_ids'], data['evcs_buses'],
+                                data['n_nodes'], data['edge_index'], k_hops=k_hops)
+
+    # Print forget-set sizes
+    print(f'\nScenarios ({len(scenarios)}):')
+    for sk, sv in scenarios.items():
+        print(f'  {sk:8s}  forget={len(sv["forget_indices"])} nodes  {sv["label"]}')
 
     # Filter by CLI args
     backbones = [args.backbone] if args.backbone else config['backbones']

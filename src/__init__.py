@@ -7,7 +7,7 @@ Public API:
     GCN_Graph, GAT_Graph, GIN_Graph, MODEL_CLASSES
 
   Data
-    load_evcs_data, build_graphs,
+    load_evcs_data, build_graphs, expand_forget_khop,
     stratified_split_multilabel, fit_scaler,
     EVCS_PRESETS
 
@@ -32,6 +32,7 @@ from .models import GCN_Graph, GAT_Graph, GIN_Graph, MODEL_CLASSES
 from .data import (
     load_evcs_data,
     build_graphs,
+    expand_forget_khop,
     stratified_split_multilabel,
     fit_scaler,
     EVCS_PRESETS,
@@ -61,7 +62,7 @@ __all__ = [
     # Models
     "GCN_Graph", "GAT_Graph", "GIN_Graph", "MODEL_CLASSES",
     # Data
-    "load_evcs_data", "build_graphs",
+    "load_evcs_data", "build_graphs", "expand_forget_khop",
     "stratified_split_multilabel", "fit_scaler", "EVCS_PRESETS",
     # Training
     "train_model", "evaluate_model",
