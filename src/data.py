@@ -71,17 +71,29 @@ def load_evcs_data(pkl_paths, gml_path, evcs_map=None, bus_system='34bus'):
         bus_id = evcs_map[evcs_name]
         evcs_buses[int(bus_id)] = bus_to_idx[bus_id]
 
-    # Node features: 24 hourly peak voltages (mean across 3 phases)
+    # Node features: 48-dim voltage (24 hourly mean + 24 hourly std)
+    # Phase-averaged, then split each hour (12 steps × 5 min) into mean & std.
+    # mean captures magnitude changes (Type 1/3 attacks); std captures temporal
+    # volatility within each hour (Type 2/4 time-shift and surge attacks).
+    # Replaces previous 24-dim hourly-max which discarded sub-hourly dynamics.
     n_graphs = len(raw_data)
-    all_x = np.zeros((n_graphs, n_nodes, 24), dtype=np.float32)
+    all_x = np.zeros((n_graphs, n_nodes, 48), dtype=np.float32)
     all_y = np.zeros((n_graphs, n_evcs), dtype=np.float32)
 
     for gi, scenario in enumerate(raw_data):
         bv = scenario['BusVoltage series']
         for ni, bus in enumerate(bus_names):
             voltages = np.array(bv[bus])  # (288, 3)
-            mean_phase = voltages.mean(axis=1)  # (288,)
-            all_x[gi, ni, :] = mean_phase.reshape(24, 12).max(axis=1)
+            # Use only active phases (>0.1 p.u.) to avoid 3x scaling artifact
+            # on single-phase buses (810, 818, 820, 822, 826, 856, 864, 838).
+            active = voltages.mean(axis=0) > 0.1
+            if active.any():
+                mean_phase = voltages[:, active].mean(axis=1)  # (288,)
+            else:
+                mean_phase = voltages.mean(axis=1)
+            hourly = mean_phase.reshape(24, 12)  # (24 hours, 12 steps)
+            all_x[gi, ni, :24] = hourly.mean(axis=1)
+            all_x[gi, ni, 24:] = hourly.std(axis=1)
 
         targeted = scenario['Targeted Stations']
         for evcs_idx, evcs_name in enumerate(evcs_names_ordered):
@@ -132,6 +144,36 @@ def load_evcs_data(pkl_paths, gml_path, evcs_map=None, bus_system='34bus'):
         'evcs_names': evcs_names_ordered,
         'bus_system': bus_system,
     }
+
+
+def expand_forget_khop(forget_indices, edge_index, k=0):
+    """Expand forget set to include k-hop neighbors in the graph topology.
+
+    Args:
+        forget_indices: list of node indices to forget (EVCS buses).
+        edge_index: [2, E] tensor (bidirectional edges).
+        k: number of hops to expand. k=0 returns original set unchanged.
+
+    Returns:
+        sorted list of unique node indices (original + k-hop neighbors).
+    """
+    if k == 0 or not forget_indices:
+        return list(forget_indices)
+
+    # Build adjacency list from edge_index
+    adj = {}
+    src, dst = edge_index[0].tolist(), edge_index[1].tolist()
+    for s, d in zip(src, dst):
+        adj.setdefault(s, set()).add(d)
+
+    current = set(forget_indices)
+    for _ in range(k):
+        frontier = set()
+        for node in current:
+            frontier.update(adj.get(node, set()))
+        current |= frontier
+
+    return sorted(current)
 
 
 def build_graphs(x_np, y_np, edge_idx, n_nodes, n_feat,

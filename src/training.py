@@ -163,34 +163,60 @@ def evaluate_model(model, loader, device):
 
 
 def compute_mia_auc(model, member_loader, non_member_loader, device,
-                    pos_weights=None):
-    """Loss-based MIA for multi-label. AUC near 0.5 = good forgetting."""
+                    pos_weights=None, forget_label_idx=None):
+    """Loss-based MIA for multi-label, split by forget/retain labels.
+
+    Following OpenGU (Fan et al., 2025), MIA should measure information
+    leakage about the *forgotten* data specifically, not the overall
+    train/test generalization gap.
+
+    Args:
+        forget_label_idx: list of label column indices for forget EVCS.
+            e.g. S1 forgets EVCS1 -> [0]; S2 -> [0,1]; S3 -> [0,1,2].
+            If None, falls back to overall-only (backward compatible).
+
+    Returns:
+        dict with keys: mia_forget, mia_retain, mia_overall.
+        mia_retain is NaN when all labels are forget (e.g. S3).
+    """
     model.eval()
     criterion = nn.BCEWithLogitsLoss(reduction='none', pos_weight=pos_weights)
-    losses, labels = [], []
+    all_losses, all_labels = [], []  # per-label losses [B, n_labels]
 
     with torch.no_grad():
-        for batch in member_loader:
-            batch = batch.to(device)
-            loss = criterion(model(batch), batch.y).mean(dim=1)
-            losses.append(loss.cpu())
-            labels.append(torch.ones(len(loss)))
+        for loader, lbl in [(member_loader, 1), (non_member_loader, 0)]:
+            for batch in loader:
+                batch = batch.to(device)
+                loss = criterion(model(batch), batch.y)  # [B, n_labels]
+                all_losses.append(loss.cpu())
+                all_labels.append(torch.full((loss.size(0),), lbl))
 
-        for batch in non_member_loader:
-            batch = batch.to(device)
-            loss = criterion(model(batch), batch.y).mean(dim=1)
-            losses.append(loss.cpu())
-            labels.append(torch.zeros(len(loss)))
+    losses = torch.cat(all_losses).numpy()   # [N, n_labels]
+    labels = torch.cat(all_labels).numpy()   # [N]
 
-    losses = torch.cat(losses).numpy()
-    labels = torch.cat(labels).numpy()
+    if np.any(np.isnan(losses)) or len(np.unique(labels)) < 2:
+        return {'mia_forget': 0.5, 'mia_retain': 0.5, 'mia_overall': 0.5}
 
-    if np.any(np.isnan(losses)):
-        return 0.5
-    scores = -losses
-    if len(np.unique(labels)) < 2:
-        return 0.5
-    return float(roc_auc_score(labels, scores))
+    def _auc(col_idx):
+        if not col_idx:
+            return np.nan
+        scores = -losses[:, col_idx].mean(axis=1)
+        return float(roc_auc_score(labels, scores))
+
+    n_labels = losses.shape[1]
+    all_idx = list(range(n_labels))
+
+    if forget_label_idx is not None:
+        retain_idx = [i for i in all_idx if i not in forget_label_idx]
+        mia_forget = _auc(forget_label_idx)
+        mia_retain = _auc(retain_idx)
+    else:
+        mia_forget = np.nan
+        mia_retain = np.nan
+
+    mia_overall = _auc(all_idx)
+    return {'mia_forget': mia_forget, 'mia_retain': mia_retain,
+            'mia_overall': mia_overall}
 
 
 def save_checkpoint(model, path, backbone, scenario, seed):

@@ -38,3 +38,4 @@ gif:                       # GIF & IDEA shared hyperparameters
 experiment:
   seeds:     [42, 77, 88, 124, 137, 226, 347, 499, 666, 999]
   backbones: [GAT, GCN, GIN]
+  k_hops:    [0, 1, 2]           # k-hop neighbor expansion for forget set

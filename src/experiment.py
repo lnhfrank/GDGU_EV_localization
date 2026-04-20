@@ -23,14 +23,15 @@ def _peak_memory_mb(device):
 
 def run_single_trial(backbone_name, scen_key, scen_val, seed,
                      all_x, all_y, edge_index_t, config, device):
-    """Run Original + GDGU + Retrain for one (backbone, scenario, seed).
+    """Run Original + GDGU + GIF + IDEA + Retrain for one (backbone, scenario, seed).
 
     Returns:
-        list of 3 result dicts (Original, GDGU, Retrain),
+        list of 5 result dicts,
         dict of epoch_logs keyed by method name.
     """
     forget_idx = scen_val['forget_indices']
     scen_label = scen_val['label']
+    forget_label_idx = scen_val.get('forget_label_indices')  # [0], [0,1], or [0,1,2]
     n_nodes, n_feat = all_x.shape[1], all_x.shape[2]
 
     print(f"\n{'='*70}")
@@ -103,8 +104,10 @@ def run_single_trial(backbone_name, scen_key, scen_val, seed,
           f"MacroROC={res_o['macro_roc']:.4f}  MacroF1={res_o['macro_f1']:.4f}  "
           f"Time={time_orig:.1f}s  Mem={mem_orig:.1f}MB")
 
+    mia_orig = {'mia_forget': np.nan, 'mia_retain': np.nan, 'mia_overall': np.nan}
     results.append(_build_result(backbone_name, scen_key, seed, 'Original',
-                                 res_o, np.nan, time_orig, mem_orig))
+                                 res_o, mia_orig, time_orig, mem_orig,
+                                 forget_label_idx=forget_label_idx))
 
     # ── (B) GDGU ──
     model_gdgu = copy.deepcopy(model_orig)
@@ -120,13 +123,16 @@ def run_single_trial(backbone_name, scen_key, scen_val, seed,
     mem_gdgu = _peak_memory_mb(device)
 
     res_g = evaluate_model(model_gdgu, test_loader_unl, device)
-    mia_gdgu = compute_mia_auc(model_gdgu, train_loader_unl, test_loader_unl, device, pw)
+    mia_gdgu = compute_mia_auc(model_gdgu, train_loader_unl, test_loader_unl,
+                                device, pw, forget_label_idx=forget_label_idx)
     print(f"  [GDGU]      ExMatch={res_g['exact_match']:.4f}  "
           f"MacroROC={res_g['macro_roc']:.4f}  MacroF1={res_g['macro_f1']:.4f}  "
-          f"MIA={mia_gdgu:.4f}  Time={time_gdgu:.1f}s  Mem={mem_gdgu:.1f}MB")
+          f"MIA_f={mia_gdgu['mia_forget']:.4f}  MIA_r={mia_gdgu['mia_retain']:.4f}  "
+          f"Time={time_gdgu:.1f}s  Mem={mem_gdgu:.1f}MB")
 
     results.append(_build_result(backbone_name, scen_key, seed, 'GDGU',
-                                 res_g, mia_gdgu, time_gdgu, mem_gdgu))
+                                 res_g, mia_gdgu, time_gdgu, mem_gdgu,
+                                 forget_label_idx=forget_label_idx))
 
     # ── (C) GIF ──
     model_gif = copy.deepcopy(model_orig)
@@ -144,13 +150,16 @@ def run_single_trial(backbone_name, scen_key, scen_val, seed,
     mem_gif = _peak_memory_mb(device)
 
     res_gif = evaluate_model(model_gif, test_loader_unl, device)
-    mia_gif = compute_mia_auc(model_gif, train_loader_unl, test_loader_unl, device, pw)
+    mia_gif = compute_mia_auc(model_gif, train_loader_unl, test_loader_unl,
+                               device, pw, forget_label_idx=forget_label_idx)
     print(f"  [GIF]       ExMatch={res_gif['exact_match']:.4f}  "
           f"MacroROC={res_gif['macro_roc']:.4f}  MacroF1={res_gif['macro_f1']:.4f}  "
-          f"MIA={mia_gif:.4f}  Time={time_gif:.1f}s  Mem={mem_gif:.1f}MB")
+          f"MIA_f={mia_gif['mia_forget']:.4f}  MIA_r={mia_gif['mia_retain']:.4f}  "
+          f"Time={time_gif:.1f}s  Mem={mem_gif:.1f}MB")
 
     results.append(_build_result(backbone_name, scen_key, seed, 'GIF',
-                                 res_gif, mia_gif, time_gif, mem_gif))
+                                 res_gif, mia_gif, time_gif, mem_gif,
+                                 forget_label_idx=forget_label_idx))
 
     # ── (D) IDEA ──
     model_idea = copy.deepcopy(model_orig)
@@ -170,13 +179,16 @@ def run_single_trial(backbone_name, scen_key, scen_val, seed,
     mem_idea = _peak_memory_mb(device)
 
     res_idea = evaluate_model(model_idea, test_loader_unl, device)
-    mia_idea = compute_mia_auc(model_idea, train_loader_unl, test_loader_unl, device, pw)
+    mia_idea = compute_mia_auc(model_idea, train_loader_unl, test_loader_unl,
+                                device, pw, forget_label_idx=forget_label_idx)
     print(f"  [IDEA]      ExMatch={res_idea['exact_match']:.4f}  "
           f"MacroROC={res_idea['macro_roc']:.4f}  MacroF1={res_idea['macro_f1']:.4f}  "
-          f"MIA={mia_idea:.4f}  Time={time_idea:.1f}s  Mem={mem_idea:.1f}MB")
+          f"MIA_f={mia_idea['mia_forget']:.4f}  MIA_r={mia_idea['mia_retain']:.4f}  "
+          f"Time={time_idea:.1f}s  Mem={mem_idea:.1f}MB")
 
     results.append(_build_result(backbone_name, scen_key, seed, 'IDEA',
-                                 res_idea, mia_idea, time_idea, mem_idea))
+                                 res_idea, mia_idea, time_idea, mem_idea,
+                                 forget_label_idx=forget_label_idx))
 
     # ── (E) Retrain from scratch ──
     # Re-seed so Retrain gets the same kaiming_init as Original.
@@ -205,17 +217,20 @@ def run_single_trial(backbone_name, scen_key, scen_val, seed,
     all_epoch_logs['Retrain'] = logs_retrain
 
     res_r = evaluate_model(model_retrain, test_loader_unl, device)
-    mia_retrain = compute_mia_auc(model_retrain, train_loader_unl, test_loader_unl, device, pw)
+    mia_retrain = compute_mia_auc(model_retrain, train_loader_unl, test_loader_unl,
+                                   device, pw, forget_label_idx=forget_label_idx)
     print(f"  [Retrain]   ExMatch={res_r['exact_match']:.4f}  "
           f"MacroROC={res_r['macro_roc']:.4f}  MacroF1={res_r['macro_f1']:.4f}  "
-          f"MIA={mia_retrain:.4f}  Time={time_retrain:.1f}s  Mem={mem_retrain:.1f}MB")
+          f"MIA_f={mia_retrain['mia_forget']:.4f}  MIA_r={mia_retrain['mia_retain']:.4f}  "
+          f"Time={time_retrain:.1f}s  Mem={mem_retrain:.1f}MB")
     print(f"  Speedup vs Retrain: "
           f"GDGU {time_retrain / max(time_gdgu, 1e-6):.1f}x  "
           f"GIF {time_retrain / max(time_gif, 1e-6):.1f}x  "
           f"IDEA {time_retrain / max(time_idea, 1e-6):.1f}x")
 
     results.append(_build_result(backbone_name, scen_key, seed, 'Retrain',
-                                 res_r, mia_retrain, time_retrain, mem_retrain))
+                                 res_r, mia_retrain, time_retrain, mem_retrain,
+                                 forget_label_idx=forget_label_idx))
 
     # Cleanup
     del model_orig, model_gdgu, model_gif, model_idea, model_retrain
@@ -224,7 +239,8 @@ def run_single_trial(backbone_name, scen_key, scen_val, seed,
     return results, all_epoch_logs
 
 
-def _build_result(backbone, scenario, seed, method, eval_dict, mia, elapsed, mem_mb):
+def _build_result(backbone, scenario, seed, method, eval_dict, mia_dict,
+                   elapsed, mem_mb, forget_label_idx=None):
     """Build a flat result dict from evaluation output (dynamic EVCS count)."""
     row = {
         'Backbone': backbone, 'Scenario': scenario, 'Seed': seed,
@@ -234,11 +250,35 @@ def _build_result(backbone, scenario, seed, method, eval_dict, mia, elapsed, mem
         'Macro_ROC': eval_dict['macro_roc'],
         'Macro_F1': eval_dict['macro_f1'],
     }
-    for i, roc in enumerate(eval_dict['per_roc']):
+    per_roc = eval_dict['per_roc']
+    per_f1 = eval_dict['per_f1']
+    for i, roc in enumerate(per_roc):
         row[f'ROC_EVCS{i+1}'] = roc
-    for i, f1 in enumerate(eval_dict['per_f1']):
+    for i, f1 in enumerate(per_f1):
         row[f'F1_EVCS{i+1}'] = f1
-    row['MIA_AUC'] = mia
+
+    # Forget / retain grouped metrics
+    if forget_label_idx is not None:
+        n_labels = len(per_f1)
+        retain_idx = [i for i in range(n_labels) if i not in forget_label_idx]
+        row['F1_forget'] = float(np.mean([per_f1[i] for i in forget_label_idx]))
+        row['ROC_forget'] = float(np.mean([per_roc[i] for i in forget_label_idx]))
+        if retain_idx:
+            row['F1_retain'] = float(np.mean([per_f1[i] for i in retain_idx]))
+            row['ROC_retain'] = float(np.mean([per_roc[i] for i in retain_idx]))
+        else:
+            row['F1_retain'] = np.nan
+            row['ROC_retain'] = np.nan
+    else:
+        row['F1_forget'] = np.nan
+        row['ROC_forget'] = np.nan
+        row['F1_retain'] = np.nan
+        row['ROC_retain'] = np.nan
+
+    # MIA split (OpenGU-aligned)
+    row['MIA_forget'] = mia_dict['mia_forget']
+    row['MIA_retain'] = mia_dict['mia_retain']
+    row['MIA_AUC'] = mia_dict['mia_overall']  # backward compatible
     row['Time'] = elapsed
     row['Peak_Memory_MB'] = mem_mb
     return row

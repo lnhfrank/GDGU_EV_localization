@@ -80,6 +80,18 @@ def apply_style(overrides=None):
 # ============================================================
 #  Data loading
 # ============================================================
+def _scenario_sort_key(s):
+    """Sort key for scenario names like 'S1', 'S2-0', 'S3-1'.
+
+    Returns (n, k) tuple so S1-0 < S1-1 < S1-2 < S2-0 < ...
+    Legacy names without '-k' suffix get k=-1 so they sort first.
+    """
+    if '-' in s:
+        parts = s.split('-')
+        return (int(parts[0][1:]), int(parts[1]))
+    return (int(s[1:]), -1)
+
+
 def load_results(results_dir, bus_system='123bus'):
     """Load raw CSV from a date-named results folder.
 
@@ -93,7 +105,7 @@ def load_results(results_dir, bus_system='123bus'):
     csv_path = os.path.join(results_dir, f'{bus_system}_results_raw.csv')
     df = pd.read_csv(csv_path)
 
-    scen_keys = sorted(df.Scenario.unique(), key=lambda s: int(s[1:]))
+    scen_keys = sorted(df.Scenario.unique(), key=_scenario_sort_key)
     scenarios = {sk: {'label': sk} for sk in scen_keys}
     backbones = sorted(df.Backbone.unique())
 
@@ -112,7 +124,16 @@ def _savefig(fig, filepath):
 
 
 def _scen_labels(scenarios):
-    return [scenarios[s]['label'].split(':')[0] for s in scenarios]
+    """Return short display labels for scenarios.
+
+    For Sn-k format (e.g. 'S1-0'), use the key directly.
+    For legacy format with full label, take the part before ':'.
+    """
+    labels = []
+    for s in scenarios:
+        lbl = scenarios[s]['label']
+        labels.append(lbl.split(':')[0] if ':' in lbl else s)
+    return labels
 
 
 def _available_methods(df):
@@ -472,6 +493,143 @@ def plot_gu_comparison(df, filepath, scenarios, backbones):
     plt.show()
 
 
+def plot_khop_comparison(df, filepath, backbones, metric_col='MIA_AUC',
+                         ylabel='MIA-AUC', ylim=None):
+    """Compare k-hop expansion levels for each base scenario (Sn).
+
+    For each backbone subplot, X-axis = k values, one line per GU method + Retrain.
+    Each figure covers one base scenario Sn (all k values).
+    Produces one figure per Sn, with 1×len(backbones) subplots.
+
+    Args:
+        df:         DataFrame with Scenario column in 'Sn-k' format.
+        filepath:   base filepath — Sn is appended, e.g. '...khop_MIA_S1.pdf'.
+        backbones:  list of backbone names.
+        metric_col: column to plot.
+        ylabel:     Y-axis label.
+        ylim:       (ymin, ymax) or None for auto.
+    """
+    S = STYLE
+    methods = [m for m in ['GDGU', 'GIF', 'IDEA', 'Retrain']
+               if m in df.Method.unique()]
+
+    # Parse Sn-k structure from scenario names
+    scen_names = sorted(df.Scenario.unique(), key=_scenario_sort_key)
+    # Group by base scenario number
+    base_groups = {}
+    for s in scen_names:
+        if '-' not in s:
+            continue
+        n, k = s.split('-')
+        base_groups.setdefault(n, []).append((int(k), s))
+
+    if not base_groups:
+        print(f'  [skip] No Sn-k format scenarios found — skipping k-hop comparison')
+        return
+
+    for base_sn, k_list in sorted(base_groups.items()):
+        k_list.sort()
+        k_vals = [kv[0] for kv in k_list]
+        scen_keys = [kv[1] for kv in k_list]
+
+        n_bb = len(backbones)
+        fig, axes = plt.subplots(1, n_bb, figsize=(7 * n_bb, 5.5), sharey=True)
+        if n_bb == 1:
+            axes = [axes]
+
+        for ax_idx, bb in enumerate(backbones):
+            ax = axes[ax_idx]
+            for method in methods:
+                means, stds = [], []
+                for sk in scen_keys:
+                    sub = df[(df.Backbone == bb) & (df.Scenario == sk) & (df.Method == method)]
+                    means.append(sub[metric_col].mean() if len(sub) > 0 else np.nan)
+                    stds.append(sub[metric_col].std() if len(sub) > 0 else 0)
+                means, stds = np.array(means), np.array(stds)
+                ls = '--' if method == 'Retrain' else '-'
+                lw = 1.5 if method == 'Retrain' else 2.5
+                ax.plot(k_vals, means, marker=S['markers'][method],
+                        color=S['colors'][method], label=method,
+                        linewidth=lw, linestyle=ls, markersize=9)
+                ax.fill_between(k_vals, means - stds, means + stds,
+                                color=S['colors'][method], alpha=S['fill_alpha'])
+
+            if metric_col == 'MIA_AUC':
+                ax.axhline(y=0.5, color=S['ideal_line_color'], linestyle='--',
+                           alpha=0.6, label='Ideal (0.5)')
+
+            ax.set_title(bb, fontsize=S['fs_subtitle'], fontweight='bold')
+            ax.set_xticks(k_vals)
+            ax.set_xticklabels([f'k={k}' for k in k_vals], fontsize=S['fs_tick'])
+            ax.tick_params(axis='y', labelsize=S['fs_tick'])
+            ax.set_xlabel('k-hop expansion', fontsize=S['fs_label'])
+            if ax_idx == 0:
+                ax.set_ylabel(ylabel, fontsize=S['fs_label'])
+            if ylim:
+                ax.set_ylim(ylim)
+            ax.grid(True, alpha=S['grid_alpha'])
+        axes[-1].legend(fontsize=S['fs_legend'], loc='best')
+        plt.suptitle(f'{base_sn}: {ylabel} vs k-hop',
+                     fontsize=S['fs_label'] + 2, fontweight='bold', y=1.02)
+        plt.tight_layout()
+
+        # Construct per-Sn filepath
+        base, ext = os.path.splitext(filepath)
+        out_path = f'{base}_{base_sn}{ext}'
+        _savefig(fig, out_path)
+        plt.show()
+
+
+def plot_khop_forget_size(df, filepath, backbones, scenarios):
+    """Bar chart: number of forget nodes per scenario, colored by k value.
+
+    Quick overview of how much data each Sn-k scenario removes.
+    """
+    S = STYLE
+    scen_names = sorted(scenarios.keys(), key=_scenario_sort_key)
+
+    # Extract forget node counts from scenario labels
+    # Label format: 'S1-0: Bus 814 (k=0, 1 node, 2.7%)'
+    import re
+    scen_data = []
+    for sk in scen_names:
+        if '-' not in sk:
+            continue
+        lbl = scenarios[sk]['label']
+        m = re.search(r'(\d+) nodes?', lbl)
+        n_forget = int(m.group(1)) if m else 0
+        parts = sk.split('-')
+        scen_data.append({'scen': sk, 'base': parts[0], 'k': int(parts[1]),
+                          'n_forget': n_forget})
+
+    if not scen_data:
+        return
+
+    k_colors = {0: '#2196F3', 1: '#FF9800', 2: '#E91E63'}
+    fig, ax = plt.subplots(figsize=(max(12, len(scen_data) * 0.8), 5))
+    x = np.arange(len(scen_data))
+    colors = [k_colors.get(d['k'], '#999') for d in scen_data]
+    bars = ax.bar(x, [d['n_forget'] for d in scen_data], color=colors,
+                  edgecolor='black', linewidth=0.5)
+
+    ax.set_xticks(x)
+    ax.set_xticklabels([d['scen'] for d in scen_data],
+                       fontsize=S['fs_tick'] - 4, rotation=45, ha='right')
+    ax.set_ylabel('Forget set size (nodes)', fontsize=S['fs_label'])
+    ax.tick_params(axis='y', labelsize=S['fs_tick'])
+    ax.grid(axis='y', alpha=S['grid_alpha'])
+
+    # Legend for k values
+    from matplotlib.patches import Patch
+    k_vals = sorted(set(d['k'] for d in scen_data))
+    legend_patches = [Patch(facecolor=k_colors.get(k, '#999'), label=f'k={k}')
+                      for k in k_vals]
+    ax.legend(handles=legend_patches, fontsize=S['fs_legend'])
+    plt.tight_layout()
+    _savefig(fig, filepath)
+    plt.show()
+
+
 # ============================================================
 #  Convenience: generate all figures at once
 # ============================================================
@@ -510,5 +668,21 @@ def plot_all(df, output_dir, scenarios, backbones, bus_system='34bus'):
     plot_time_comparison(df, j('Time_comparison'), scenarios, backbones)
     plot_memory_usage(df, j('Memory_usage'), scenarios, backbones)
     plot_gu_comparison(df, j('GU_method_comparison'), scenarios, backbones)
+
+    # k-hop comparison plots (only when Sn-k scenarios exist)
+    has_khop = any('-' in s for s in df.Scenario.unique())
+    if has_khop:
+        # plot_khop_comparison appends _Sn to the base path internally
+        fmt = STYLE['save_fmt']
+        khop_base = lambda name: os.path.join(output_dir, f'{bus_system}_{name}.{fmt}')
+        plot_khop_comparison(df, khop_base('khop_MIA'),
+                             backbones, 'MIA_AUC', 'MIA-AUC', (0.3, 1.0))
+        plot_khop_comparison(df, khop_base('khop_MacroF1'),
+                             backbones, 'Macro_F1', 'Macro F1', (0.0, 1.0))
+        plot_khop_comparison(df, khop_base('khop_MacroROC'),
+                             backbones, 'Macro_ROC', 'Macro ROC-AUC', (0.4, 1.0))
+        plot_khop_comparison(df, khop_base('khop_ExMatch'),
+                             backbones, 'ExMatch', 'Exact Match', (0.0, 1.0))
+        plot_khop_forget_size(df, j('khop_forget_size'), backbones, scenarios)
 
     print(f"\nAll figures saved to {output_dir}/ (prefix: {bus_system}_)")
