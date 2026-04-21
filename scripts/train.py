@@ -30,7 +30,7 @@ CONFIG_DIR = PROJECT_ROOT / 'config'
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.data import load_evcs_data, expand_forget_khop
-from src.experiment import run_single_trial
+from src.experiment import run_single_trial, run_single_trial_dual
 from src.models import MODEL_CLASSES
 
 
@@ -53,6 +53,7 @@ def load_experiment(bus_system: str, source_data: Path) -> dict:
     g = cfg['gdgu']
     gi = cfg.get('gif', {})
     e = cfg['experiment']
+    dc = cfg.get('dual_channel', {})
 
     # Resolve pkl_paths: support glob patterns (123-bus) and plain filenames
     raw_paths = d['pkl_paths']
@@ -95,6 +96,14 @@ def load_experiment(bus_system: str, source_data: Path) -> dict:
             'seeds':              e['seeds'],
             'backbones':          e['backbones'],
             'k_hops':             e.get('k_hops', [0]),
+            # ── dual-channel (Scheme A) ──
+            'dual_channel': {
+                'graph_feat_dim':   dc.get('graph_feat_dim', 120),
+                'graph_mlp_hidden': dc.get('graph_mlp_hidden', 64),
+                'graph_mlp_out':    dc.get('graph_mlp_out', 32),
+                'alpha':            dc.get('alpha', 1.0),
+                'beta':             dc.get('beta', 1.0),
+            },
         },
     }
 
@@ -220,10 +229,16 @@ def main():
                         help='Single k-hop value to run (0/1/2). Default: all from config')
     parser.add_argument('--seed', type=int, default=None,
                         help='Single seed to run. Default: all seeds from config')
+    parser.add_argument('--seeds', type=int, nargs='+', default=None,
+                        help='Multiple seeds to run, e.g. --seeds 42 77 88. '
+                             'Overrides config["seeds"]; ignored if --seed is set.')
     parser.add_argument('--data-dir', type=str, default=None,
                         help='Override source data directory')
     parser.add_argument('--gpu', type=int, default=1,
                         help='GPU device index (default: 1)')
+    parser.add_argument('--dual', action='store_true',
+                        help='Use dual-channel model (Scheme A). '
+                             'Runs Original + GDGU + GIF + IDEA + Retrain (V5.1).')
     args = parser.parse_args()
 
     # Device
@@ -270,7 +285,12 @@ def main():
 
     # Filter by CLI args
     backbones = [args.backbone] if args.backbone else config['backbones']
-    seeds = [args.seed] if args.seed else config['seeds']
+    if args.seed is not None:
+        seeds = [args.seed]
+    elif args.seeds is not None:
+        seeds = args.seeds
+    else:
+        seeds = config['seeds']
     scen_filter = {args.scenario: scenarios[args.scenario]} if args.scenario else scenarios
 
     # Run
@@ -285,10 +305,16 @@ def main():
             for seed in seeds:
                 count += 1
                 print(f'\n[{count}/{total}]')
-                trial_results, trial_logs = run_single_trial(
-                    backbone, scen_key, scen_val, seed,
-                    data['all_x'], data['all_y'], data['edge_index'],
-                    config, device)
+                if args.dual:
+                    trial_results, trial_logs = run_single_trial_dual(
+                        backbone, scen_key, scen_val, seed,
+                        data['all_x'], data['all_V'], data['all_y'],
+                        data['edge_index'], config, device)
+                else:
+                    trial_results, trial_logs = run_single_trial(
+                        backbone, scen_key, scen_val, seed,
+                        data['all_x'], data['all_y'], data['edge_index'],
+                        config, device)
                 results_all.extend(trial_results)
                 all_logs[f'{backbone}_{scen_key}_{seed}'] = trial_logs
                 print(f'  Finished at {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}')
@@ -301,6 +327,8 @@ def main():
 
     # Tag for partial runs
     tag = bus_system
+    if args.dual:
+        tag += '_dual'
     if args.backbone:
         tag += f'_{args.backbone}'
     if args.scenario:

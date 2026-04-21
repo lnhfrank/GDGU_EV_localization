@@ -2,6 +2,213 @@
 
 ---
 
+## V5.3 — GU_EV_loc.20260421 *(not committed — exploratory)*
+
+**Date:** 2026-04-21
+**Branch:** `feat/two-controller-unlearning` (planned)
+**Status:** Conceptual design + single-seed smoke test passed; L2 attack protocol needs refinement
+**Results:** `results/smoke_A_2026-04-21_15/`
+
+### Motivation
+
+V5.0's dual-channel architecture resolved the detection/localization leakage problem but inherited a deeper semantic issue: **who actually owns which data in the EVCS–grid system?**
+
+- **DSO (Distribution System Operator)** owns bus voltage (V) and branch flow measurements. V is collected via SCADA/PMU infrastructure.
+- **EVCS operator** owns charging power (P) at each station's PCC (Point of Common Coupling) meter. Under GDPR/CCPA right-to-erasure, **P is the only variable the EVCS can legitimately revoke**.
+
+V5.0 and earlier versions implicitly "forgot an EVCS" by zeroing the voltage features at its bus and masking incident edges — but **those are DSO-owned quantities the EVCS has no claim over**. This is not a right-to-be-forgotten scenario; it is "DSO unlearns its own bus."
+
+The Jacob 2025 EVCS TDA paper (same group) explicitly frames EVCS attack detection as "DSO-level, from the grid operator's perspective" — under that framing the unlearning question is semantically ill-defined.
+
+V5.3 reformulates the problem as a **two-controller data-ownership model** and implements **modality-level unlearning**: P is exposed as an EVCS-contributed input channel, and unlearning removes only the P channel of the revoking station while V (DSO-owned) stays intact.
+
+### Key Updates
+
+1. **Two-controller input design (A-append)** (`scripts/smoke_A/smoke_dualch_A.py`, prototype)
+   - Node feature dim extended from 48 to **96 = [V_48 | P_48]**
+   - For EVCS nodes: V-half = hourly mean+std of voltage; P-half = hourly mean+std of charging power (from `EVCSAttacks_34.pkl['EVCS power series']`)
+   - For non-EVCS nodes: V-half populated, P-half zeroed (binary mask implicit in layout)
+   - V and P scaled by **separate StandardScalers** fit on the training subset (prevents cross-station P-magnitude leakage of identity)
+
+2. **Modality-level unlearning semantics** (`scripts/smoke_A/` prototype)
+   - New `build_pyg_dataset(..., forget_P_only=True)`: zeros dims 48:96 at the forget node; **V stays intact, edges are NOT masked** (contrast with V5.0's `build_graphs()` which zeros all 48 V-dims and removes incident edges)
+   - Rationale: only the EVCS-owned modality is revoked; DSO-owned V remains usable by the grid operator for legitimate detection/localization
+   - The V5.0 GDGU-dual pipeline applies unchanged; the difference is only in what gets zeroed in the training data
+
+3. **L1/L2 privacy evaluation matrix** (new, prototype)
+   - **L1 — Utility Preservation**: Macro-F1 / Macro-ROC (localization), DetAUC (detection)
+   - **L2 — Modality Erasure** (4 sub-metrics):
+     - **L2-a Attribution**: gradient norm on P-channel at the forget node
+     - **L2-b Occlusion ΔAUC**: AUC(P present) − AUC(P occluded)
+     - **L2-c Reconstruction attack**: MLP decoder from graph embedding to P_48; MSE vs population baseline
+     - **L2-d Property inference** (planned, not yet implemented): 3-way EVCS-ID classifier on graph embedding
+
+### Smoke-test results (GIN × S1-0 × seed 42, single trial)
+
+| Method | Macro-F1 | Macro-ROC | DetAUC | Time |
+|---|---|---|---|---|
+| Original (V+P)              | 1.0000 | 1.0000 | 0.9074 | 11.8s |
+| GDGU-dual-A (forget P_814)  | 0.9769 | 0.9912 | 0.9074 | 6.4s  |
+| Retrain-A   (P_814 zeroed)  | 0.9861 | 0.9952 | 0.9247 | 17.5s |
+
+| L2 metric | Original | GDGU-dual-A | Retrain-A | Verdict |
+|---|---|---|---|---|
+| Occlusion ΔAUC         | +0.0883  | −0.0088  | −0.0510  | ✅ strong erasure signal |
+| P-channel grad norm    | 0.000107 | 0.003658 | 0.008213 | ❌ loss-saturation confound |
+| Recon MSE / baseline   | 0.502    | 0.420    | 0.510    | ❌ V→P physical bypass |
+
+**L1 findings**: Original F1=1.0 reflects task trivialization — seeing P directly makes attack detection near-deterministic (Algorithm 1 in Jacob 2025 attacks P, not V). Once the P shortcut is removed, GDGU-dual-A retains F1=0.977 via V-only physical propagation. Detection AUC is identical to Original by construction (channel isolation).
+
+**L2-b works** (Occlusion ΔAUC): Original drops 8.8 AUC points when P is hidden at test time; unlearned models show zero dependence on P — the cleanest evidence of successful modality erasure.
+
+**L2-a fails** (Attribution): Original's loss ≈ 0 at F1=1.0 saturates all gradients to ≈ 0, inverting the metric direction. Needs replacement with logit-gradient or Integrated Gradients.
+
+**L2-c fails** (Reconstruction): the pooled graph embedding still contains V at bus 814 (DSO-owned, never masked), and V is physically determined by P, so the decoder bypasses the model's memory and reconstructs P through the physical path. Needs replacement with node-level embedding + property-level attack targets.
+
+### Pending work
+
+**1. L2 attack protocol 2.0** (immediate next step — refine + expand):
+- **L2-a Attribution (fix)**: replace loss-gradient with **Integrated Gradients on logits** at the forget node (solves F1=1.0 saturation that collapsed gradients to ≈0)
+- **L2-c Reconstruction (redesign)**: swap pooled graph embedding for **node-level embedding at the forget node**; targets shift from raw P_48 to **weakly-V-correlated properties** (reduces V→P physical bypass)
+- **L2-d Property Inference (implement)**: frozen-backbone linear probe for **EVCS-ID 3-way** on forget-node embedding
+- **L2-e Attack-Type Inference (NEW — promoted to primary metric)**: frozen-backbone linear probe for **5-way attack-type** (nil + 4 attack types) on forget-node embedding. Three-point comparison:
+  - Original (V+P) — attack-type acc = ceiling (model sees P directly)
+  - GDGU-dual-A (P→0) — expected to drop if modality erasure works
+  - Retrain-A (trained without P at forget node) — **physical-leakage floor** (what V alone leaks)
+  - Verdict rules: `GDGU ≈ Retrain` ✅ effective erasure; `GDGU >> Retrain` ❌ residual P-memory; `Retrain itself high` → report as inherent grid-physics limit (same framing as V2.0 MIA-AUC narrative)
+
+**2. Efficiency evaluation** (new, required for paper narrative):
+- **Wall-clock time** per unlearning run, median ± std over 10 seeds on cuda:1
+- **Speedup ratio** = `t_retrain / t_{GDGU, GIF, IDEA}`
+- **Gradient-step count**: Retrain-A (~300 epochs × full loader) vs GDGU/GIF/IDEA (25 fine-tune epochs + one-shot gradient/HVP op)
+- **Quality–Efficiency Pareto**: x=time, y=Macro-F1 on retain set — expected: GDGU top-left, Retrain top-right; re-uses V2.0 Table pattern
+
+**3. Framing of novelty** (documentation, no code):
+- Primary contribution: the **two-controller + modality-level forgetting** problem formulation (Route A)
+- Secondary: Route A is demonstrated across **GDGU / GIF / IDEA / Retrain** to establish the formulation as an **algorithm-agnostic plug-in framework** (mirrors task-aware MU paper's positioning)
+- Implication: all V2.0 unlearning infrastructure is reusable; V5.3 changes only the data-path semantics
+
+**4. Production integration** (planned — files to touch):
+- `src/data.py`: add `build_P_features()` (hourly mean+std = 48d from `EVCSAttacks_34.pkl['EVCS power series']`); extend `load_evcs_data()` return; add `fit_separate_scalers()` for V/P; modify `build_graphs()` to accept `forget_P_only=True` (zero dims 48:96 only, keep edges)
+- `src/models.py`: bump DualChannel_Graph `in_dim` 48 → 96
+- `src/experiment.py`: new `run_single_trial_dual_A()` wrapping A-append + modality-forget + 4 methods
+- `src/privacy.py` **(new module)**: `L2_a_integrated_gradients()`, `L2_b_occlusion_delta_auc()`, `L2_c_reconstruction_node_emb()`, `L2_d_property_inference()`, `L2_e_attack_type_inference()`, `measure_unlearn_efficiency()`
+- `config/34bus.yaml`: add `route_a:` (v_dim=48, p_dim=48, node_feat_dim=96) and `privacy:` (probe epochs, IG steps)
+- `scripts/train.py`: add `--route A` flag
+
+**5. Multi-seed validation**: 10 seeds × {GCN, GAT, GIN} × {S1-0, S2-0, S3-0} × {Original, GDGU, GIF, IDEA, Retrain}
+
+**6. A1 ablation**: also forget V_at_PCC alongside P (PCC meter is EVCS-owned per Jacob Fig.1b)
+
+### Files changed (vs V5.0) — so far
+
+- `scripts/smoke_A/smoke_dualch_A.py` — new standalone smoke-test prototype (data augmentation + L1/L2 evaluation, single seed)
+- `scripts/smoke_A/smoke_A.log` — full smoke-test run log
+- `results/smoke_A_2026-04-21_15/` — smoke-test outputs
+- `Version.md` — V5.3 entry added
+
+**Note**: V5.3 changes are currently confined to `scripts/smoke_A/` as a prototype. Production integration into `src/` is deferred until the L2 attack protocol 2.0 (including L2-e) is refined and smoke-test results are consistent across seeds.
+
+---
+
+## V5.0 — GU_EV_loc.20260420 *(not committed — exploratory)*
+
+**Date:** 2026-04-20
+**Branch:** `feat/dual-channel-gu`
+**Status:** Implementation complete, smoke-test passed; awaiting multi-seed validation
+**Results:** `results/2026-04-20_19/` (single-seed smoke test)
+
+### Motivation
+
+V2.0–V4.0 experiments consistently showed MIA-AUC well above 0.5 even after full Retrain. Root cause analysis (see V4.0 Privacy Radius Analysis and `/tmp/graph_level_feat.py` eval) identified a previously unaddressed leakage channel: **graph-level voltage dynamics** (e.g., system-wide temporal/spatial gradients) carry strong attack signatures that **cannot be masked by node-level forgetting**. Non-EVCS graph-level features achieve detection AUC nearly equal to EVCS-node features (EVCS 3 Type 3: 0.888 vs 0.887), proving attack signals propagate system-wide.
+
+V5.0 introduces a **dual-channel architecture with strict channel isolation** (Scheme A) to physically separate detection-relevant graph-level signals from localization-relevant node-level signals. This enables **selective unlearning** — forget only the localization capability for target EVCS, while preserving the detection capability that is not privacy-sensitive.
+
+### Key Updates
+
+1. **Dual-channel model architecture** (`src/models.py`)
+   - Refactored `GCN_Graph` / `GAT_Graph` / `GIN_Graph` to expose `encode(data)` method returning pooled graph embedding `[B, 2*hid_dim]` (backward-compatible; `forward(data)` unchanged)
+   - New `DualChannel_Graph` class wraps any backbone with strict isolation:
+     - **Node channel**: GNN backbone → Loc head → `y_loc [B, K]`
+     - **Graph channel**: MLP on graph-level features → Det head → `y_det [B]`
+     - The two heads share NO parameters; `loc_head` never sees `graph_feat`
+   - Graph MLP uses LayerNorm (not BN) to avoid interaction with BN-recalibrate during unlearning
+   - `freeze_graph_channel()` / `unfreeze_all()` methods for unlearning control
+
+2. **Graph-level feature extraction** (`src/data.py`)
+   - New `build_graph_features(all_V, edge_index)` → 120-dim per graph:
+     - **TempGrad (72d)**: system-wide temporal |dV/dt| — mean, per-hour max-avg, per-hour std-avg across nodes
+     - **EdgeGrad-light (48d)**: spatial |V_u - V_v| across edges — mean and std per hour
+   - `load_evcs_data()` now returns `all_V` (phase-averaged raw time series `[G, N, 288]`) for downstream feature extraction
+   - `build_graphs()` accepts optional `graph_feat` and auto-derives `y_det = 1(any EVCS attacked)`; `graph_feat` is NOT masked by `forget_indices` (preserves detection capability)
+   - New `fit_graph_feat_scaler()` for StandardScaler on training subset
+
+3. **Multi-task training** (`src/training.py`)
+   - `train_model_dual()`: loss = α · BCE(det) + β · BCE(loc). Default α=β=1 (strict isolation: the two channels don't share params, so no cross-contamination risk)
+   - `evaluate_model_dual()`: localization metrics + `det_acc` / `det_auc` / `det_f1`
+   - `compute_mia_auc_dual()`: MIA uses ONLY localization loss (the privacy-protected channel)
+
+4. **Dual-channel GDGU** (`src/unlearning.py`)
+   - `gdgu_dual_unlearn()`: freezes `graph_mlp` + `det_head` before gradient computation; only Node channel (backbone + loc_head) receives the GDGU update
+   - Gradient difference computed from localization loss only
+   - `_finetune_after_gdgu_dual()` continues optimizing only unfrozen params
+
+5. **Experiment pipeline** (`src/experiment.py`, `scripts/train.py`)
+   - New `run_single_trial_dual()` runs Original → GDGU-dual → Retrain (3 methods; GIF/IDEA deferred to V5.1)
+   - Retrain baseline also uses dual-channel architecture for fair comparison
+   - `--dual` CLI flag on `scripts/train.py`; output files tagged `34bus_dual_*`
+
+6. **Config** (`config/34bus.yaml`)
+   - New `dual_channel:` section with `graph_feat_dim`, `graph_mlp_hidden`, `graph_mlp_out`, `alpha`, `beta`
+
+### Architecture — Scheme A (Strict Isolation)
+
+```
+Input:  x [N, 48] + graph_feat [120]
+
+Node Channel (GNN, BN):                  Graph Channel (MLP, LayerNorm):
+  GCN/GAT/GIN backbone                     120 → 64 → 32
+    ↓ encode() → node_emb [B, 2*hid]        ↓ graph_emb_feat [B, 32]
+    ↓                                        ↓
+  Loc Head  → y_loc [B, K]                Det Head → y_det [B]
+  (localization only)                     (detection only)
+
+Unlearning: freeze graph_mlp + det_head → only Node Channel + Loc Head
+are updated by GDGU. Detection capability preserved by construction.
+```
+
+### Smoke-test results (GIN × S1-0 × seed 42, single trial)
+
+| Method | ExMatch | Macro ROC | Macro F1 | Det Acc | MIA_forget | Time |
+|---|---|---|---|---|---|---|
+| Original   | 0.840 | 0.978 | 0.931 | 0.883 | — | 33.9s |
+| GDGU-dual  | 0.850 | 0.983 | 0.942 | 0.883 | **0.621** | 7.7s |
+| Retrain    | 0.840 | 0.986 | 0.939 | 0.883 | 0.638 | 56.8s |
+
+Observations:
+- Pipeline runs end-to-end without errors
+- Detection accuracy identical across Original / GDGU / Retrain (0.883) — confirms graph channel is correctly preserved
+- GDGU-dual's MIA_forget (0.621) below Retrain's (0.638) on this single seed — trend supports hypothesis but needs multi-seed validation
+- GDGU 7.3× speedup vs Retrain
+
+### Pending validation
+
+- Multi-seed (10 seeds) run on GIN × S1-0 for statistically meaningful MIA comparison
+- Side-by-side with V2.0 single-channel (same seed 42) to isolate dual-channel contribution
+- Extension to all 3 backbones × 4 scenarios × 4 k-hops if hypothesis holds
+
+### Files changed (vs V4.0)
+
+- `src/models.py` — added `encode()` method to GCN/GAT/GIN; added `DualChannel_Graph` class
+- `src/data.py` — added `build_graph_features()`, `fit_graph_feat_scaler()`; extended `build_graphs()` with graph_feat/y_det support; `load_evcs_data()` now returns `all_V`
+- `src/training.py` — added `train_model_dual()`, `evaluate_model_dual()`, `compute_mia_auc_dual()`
+- `src/unlearning.py` — added `gdgu_dual_unlearn()` with graph-channel freezing
+- `src/experiment.py` — added `run_single_trial_dual()` and `_build_result_dual()`
+- `config/34bus.yaml` — added `dual_channel:` section
+- `scripts/train.py` — added `--dual` flag
+
+---
+
 ## V4.0 — GU_EV_loc.20260416
 
 **Date:** 2026-04-16
@@ -199,6 +406,213 @@ V2.0 experiments revealed that MIA-AUC remains well above 0.5 even for Retrain (
 4. `StandardScaler` + `kaiming_init` adopted as standard training pipeline
 
 ---
+
+---
+
+## V5.3 — GU_EV_loc.20260421 *（未提交——探索性）*
+
+**日期：** 2026-04-21
+**分支：** `feat/two-controller-unlearning`（规划中）
+**状态：** 概念设计 + 单 seed smoke test 通过；L2 攻击协议待修正
+**结果目录：** `results/smoke_A_2026-04-21_15/`
+
+### 动机
+
+V5.0 的双通道架构解决了检测/定位泄漏问题，但遗留了一个更深层的语义问题：**EVCS—电网系统里，哪部分数据到底归谁？**
+
+- **DSO（配电系统运营商）** 拥有 bus 电压 (V) 和支路潮流测量。V 来自 SCADA/PMU 基础设施。
+- **EVCS 运营商** 拥有每个站 PCC（公共接入点）计量表的充电功率 (P)。按 GDPR/CCPA 被遗忘权，**P 是 EVCS 唯一有资格召回的变量**。
+
+V5.0 及之前的版本在"遗忘 EVCS"时抹的是该 bus 的电压特征和相邻边——**但这些是 DSO 所有的量，EVCS 根本无权召回**。这不是 right-to-be-forgotten 情境，而是"DSO 遗忘自己的 bus"。
+
+Jacob 2025 EVCS TDA 论文（同组）明确把 EVCS 攻击检测定位为 "DSO-level, from the grid operator's perspective"——在该框架下 unlearning 的概念**在语义层面就不成立**。
+
+V5.3 将问题重构为**双数据控制者（Two-Controller）所有权模型**，实现**模态级遗忘**：P 作为 EVCS 贡献的输入通道被显式暴露；遗忘时只移除召回方的 P 通道，DSO 所有的 V 保持完整。
+
+### 重要更新
+
+1. **双控制者输入设计（A-append）**（`scripts/smoke_A/smoke_dualch_A.py`，原型）
+   - 节点特征维度从 48 扩展到 **96 = [V_48 | P_48]**
+   - EVCS 节点：V 半 = 电压的小时 mean+std；P 半 = 充电功率的小时 mean+std（来自 `EVCSAttacks_34.pkl['EVCS power series']`）
+   - 非 EVCS 节点：V 半填入，P 半置零（通过特征排布隐式表达二值 mask）
+   - V 和 P 使用**独立的 StandardScaler**（训练集拟合），防止不同站的 P 幅值差异泄露身份
+
+2. **模态级遗忘语义**（`scripts/smoke_A/` 原型）
+   - 新增 `build_pyg_dataset(..., forget_P_only=True)`：在 forget 节点抹掉 dims 48:96；**V 保持完整，边不被 mask**（对比 V5.0 的 `build_graphs()` 抹掉全部 48 V-dims 并移除相邻边）
+   - 理由：只召回 EVCS 自有的模态；DSO 的 V 保留供电网运营商合法检测/定位
+   - V5.0 的 GDGU-dual pipeline 无需改动即可使用；区别只在训练数据里被抹掉的内容
+
+3. **L1/L2 隐私评估矩阵**（新增，原型）
+   - **L1 —— 功能保留**：Macro-F1 / Macro-ROC（定位）、DetAUC（检测）
+   - **L2 —— 模态消除**（4 个子指标）：
+     - **L2-a 归因**：forget 节点上 P 通道的梯度范数
+     - **L2-b 遮挡 ΔAUC**：AUC(P 在) − AUC(P 被抹)
+     - **L2-c 重构攻击**：从图嵌入到 P_48 的 MLP decoder；MSE 对比 population baseline
+     - **L2-d 属性推断**（规划中，未实现）：图嵌入上 3-way EVCS-ID 分类器
+
+### Smoke-test 结果（GIN × S1-0 × seed 42，单 trial）
+
+| 方法 | Macro-F1 | Macro-ROC | DetAUC | 时间 |
+|---|---|---|---|---|
+| Original (V+P)                | 1.0000 | 1.0000 | 0.9074 | 11.8s |
+| GDGU-dual-A（遗忘 P_814）     | 0.9769 | 0.9912 | 0.9074 | 6.4s  |
+| Retrain-A（P_814 置零重训）   | 0.9861 | 0.9952 | 0.9247 | 17.5s |
+
+| L2 指标 | Original | GDGU-dual-A | Retrain-A | 判定 |
+|---|---|---|---|---|
+| Occlusion ΔAUC         | +0.0883  | −0.0088  | −0.0510  | ✅ 强消除信号 |
+| P 通道梯度范数         | 0.000107 | 0.003658 | 0.008213 | ❌ loss 饱和伪影 |
+| Recon MSE / baseline   | 0.502    | 0.420    | 0.510    | ❌ V→P 物理泄露旁路 |
+
+**L1 发现**：Original F1=1.0 反映任务被简化 —— 直接观测 P 让攻击检测几乎是确定性的（Jacob 2025 Algorithm 1 攻击的是 P 不是 V）。遗忘 P 这条捷径后，GDGU-dual-A 仍靠 V 的物理传播保持 F1=0.977。Detection AUC 由架构保证与 Original 一致（通道隔离）。
+
+**L2-b 有效**（遮挡 ΔAUC）：Original 在测试时抹掉 P 降 8.8 个 AUC 点；遗忘后的模型对 P 零依赖 —— 最干净的模态消除证据。
+
+**L2-a 失败**（归因）：Original 在 F1=1.0 时 loss≈0，所有梯度被饱和到 ≈0，导致指标方向反转。需改为 logit 梯度或 Integrated Gradients。
+
+**L2-c 失败**（重构）：池化后的图嵌入仍含 bus 814 的 V 信号（DSO 所有，永不 mask），而 V 由 P 物理决定，所以 decoder 绕过模型记忆，直接通过物理路径还原 P。需改为 node-level 嵌入 + 属性级攻击目标。
+
+### 待办
+
+**1. L2 攻击协议 2.0**（下一步立即要做——修正 + 扩展）：
+- **L2-a 归因（修复）**：把 loss 梯度换成 forget 节点 logit 的 **Integrated Gradients**（解决 F1=1.0 时梯度饱和到 ≈0 的问题）
+- **L2-c 重构（重设计）**：把池化图嵌入换成 **forget 节点的 node-level 嵌入**；目标从原始 P_48 换成**与 V 弱相关的属性**（降低 V→P 物理旁路）
+- **L2-d Property Inference（实现）**：冻结 backbone，在 forget 节点嵌入上做 **EVCS-ID 3-way 线性探针**
+- **L2-e Attack-Type Inference（新——升为主指标）**：冻结 backbone，在 forget 节点嵌入上做 **5-way attack-type**（nil + 4 种攻击）线性探针。三点对照：
+  - Original (V+P) —— attack-type acc = 上限（模型直接看到 P）
+  - GDGU-dual-A（P→0）—— 遗忘生效则应下降
+  - Retrain-A（训练时就没见过 forget 节点的 P）—— **物理泄露地板**（V 单独能泄漏多少）
+  - 判据：`GDGU ≈ Retrain` ✅ 有效遗忘；`GDGU >> Retrain` ❌ 残留 P 记忆；`Retrain 本身就高` → 写成电网物理固有限制（与 V2.0 的 MIA-AUC 叙事一致）
+
+**2. 效率评估**（新——论文叙事必需）：
+- **Wall-clock 时间**：每次遗忘运行的 cuda:1 耗时，10 seeds 的中位数 ± std
+- **加速比** = `t_retrain / t_{GDGU, GIF, IDEA}`
+- **梯度步数对比**：Retrain-A（约 300 epoch × 完整 loader）vs GDGU/GIF/IDEA（25 fine-tune epoch + 单次 gradient/HVP 算子）
+- **质量—效率 Pareto 图**：横轴 time、纵轴 retain set Macro-F1，预期 GDGU 左上、Retrain 右上；复用 V2.0 的表格结构
+
+**3. Novelty 的叙事定位**（文档层面，不改代码）：
+- 主贡献：**两控制者 + 模态级遗忘** 的问题定义本身（Route A）
+- 次贡献：Route A 在 **GDGU / GIF / IDEA / Retrain** 四方法上均可运行，建立该语义为**算法无关的 plug-in 框架**（对齐 task-aware MU 论文的定位方式）
+- 含义：V2.0 所有 unlearning 基础设施都可复用；V5.3 只改数据路径的语义
+
+**4. 生产化集成**（规划——待动文件清单）：
+- `src/data.py`：新增 `build_P_features()`（从 `EVCSAttacks_34.pkl['EVCS power series']` 抽 hourly mean+std = 48d）；扩展 `load_evcs_data()` 返回值；新增 `fit_separate_scalers()`（V/P 独立 scaler）；修改 `build_graphs()` 支持 `forget_P_only=True`（仅抹 48:96,保留边）
+- `src/models.py`：DualChannel_Graph 的 `in_dim` 从 48 提到 96
+- `src/experiment.py`：新增 `run_single_trial_dual_A()`，封装 A-append + 模态遗忘 + 4 方法
+- `src/privacy.py` **（新模块）**：`L2_a_integrated_gradients()`、`L2_b_occlusion_delta_auc()`、`L2_c_reconstruction_node_emb()`、`L2_d_property_inference()`、`L2_e_attack_type_inference()`、`measure_unlearn_efficiency()`
+- `config/34bus.yaml`：新增 `route_a:`（v_dim=48, p_dim=48, node_feat_dim=96）和 `privacy:`（probe epochs、IG steps）两段
+- `scripts/train.py`：新增 `--route A` 开关
+
+**5. 多 seed 验证**：10 seeds × {GCN, GAT, GIN} × {S1-0, S2-0, S3-0} × {Original, GDGU, GIF, IDEA, Retrain}
+
+**6. A1 消融**：加上 V_at_PCC 一起遗忘（按 Jacob Fig.1b，PCC meter 归 EVCS）
+
+### 文件变更（相对于 V5.0）—— 目前已改
+
+- `scripts/smoke_A/smoke_dualch_A.py` —— 新独立 smoke-test 原型（数据增强 + L1/L2 评估，单 seed）
+- `scripts/smoke_A/smoke_A.log` —— 完整 smoke-test 运行日志
+- `results/smoke_A_2026-04-21_15/` —— smoke-test 输出
+- `Version.md` —— 新增 V5.3 条目
+
+**注**：V5.3 改动当前限于 `scripts/smoke_A/` 原型；生产化集成到 `src/` 将推迟到 L2 攻击协议 2.0（含 L2-e）修正完成且 smoke-test 跨 seed 结果一致后进行。
+
+---
+
+## V5.0 — GU_EV_loc.20260420 *（未提交——探索性）*
+
+**日期：** 2026-04-20
+**分支：** `feat/dual-channel-gu`
+**状态：** 代码实现完成，Smoke test 通过；待多 seed 验证
+**结果目录：** `results/2026-04-20_19/`（单 seed smoke test）
+
+### 动机
+
+V2.0–V4.0 实验表明 MIA-AUC 即使 Retrain 也远高于 0.5。根因分析（见 V4.0 隐私半径分析及 `/tmp/graph_level_feat.py` 评估）识别出一条此前未处理的泄漏通道：**全图级电压动态**（如系统级时间/空间梯度）含有强攻击信号，**节点级遗忘无法屏蔽**。非 EVCS 全图特征的检测 AUC 几乎等于 EVCS 节点特征（EVCS 3 Type 3：0.888 vs 0.887），证明攻击信号系统级传播。
+
+V5.0 引入**严格隔离的双通道架构**（方案 A），在架构层面物理切断"检测相关的全图信号"与"定位相关的节点信号"。实现**选择性遗忘**——只遗忘目标 EVCS 的定位能力，保留非隐私敏感的检测能力。
+
+### 重要更新
+
+1. **双通道模型架构**（`src/models.py`）
+   - 重构 `GCN_Graph` / `GAT_Graph` / `GIN_Graph`，新增 `encode(data)` 方法返回池化后的图嵌入 `[B, 2*hid_dim]`（向后兼容，`forward(data)` 行为不变）
+   - 新增 `DualChannel_Graph` 类，严格隔离包装任意 backbone：
+     - **Node 通道**：GNN backbone → Loc head → `y_loc [B, K]`
+     - **Graph 通道**：MLP on 全图级特征 → Det head → `y_det [B]`
+     - 两个 head **不共享任何参数**；`loc_head` 永远看不到 `graph_feat`
+   - Graph MLP 使用 LayerNorm（非 BN），避免遗忘时 BN-recalibrate 对 graph 通道的干扰
+   - `freeze_graph_channel()` / `unfreeze_all()` 方法用于遗忘流程控制
+
+2. **全图级特征提取**（`src/data.py`）
+   - 新增 `build_graph_features(all_V, edge_index)` → 每图 120 维：
+     - **TempGrad (72d)**：系统级时间梯度 |dV/dt| —— 跨节点/分时段的 mean、per-hour max-avg、per-hour std-avg
+     - **EdgeGrad-light (48d)**：空间梯度 |V_u - V_v| —— 每小时跨边 mean 和 std
+   - `load_evcs_data()` 新增返回 `all_V`（相均值原始时间序列 `[G, N, 288]`），供下游特征提取使用
+   - `build_graphs()` 接受可选 `graph_feat` 并自动派生 `y_det = 1(任一 EVCS 被攻击)`；`graph_feat` **不被 `forget_indices` 屏蔽**（保护检测能力）
+   - 新增 `fit_graph_feat_scaler()`（训练集 StandardScaler）
+
+3. **多任务训练**（`src/training.py`）
+   - `train_model_dual()`：loss = α · BCE(det) + β · BCE(loc)。默认 α=β=1（严格隔离下两通道无参数共享，不存在交叉污染风险）
+   - `evaluate_model_dual()`：定位指标 + `det_acc` / `det_auc` / `det_f1`
+   - `compute_mia_auc_dual()`：MIA **只用定位 loss**（隐私保护的那部分）
+
+4. **双通道 GDGU**（`src/unlearning.py`）
+   - `gdgu_dual_unlearn()`：梯度计算前冻结 `graph_mlp` + `det_head`，只有 Node 通道（backbone + loc_head）接收 GDGU 更新
+   - 梯度差只基于定位 loss 计算
+   - `_finetune_after_gdgu_dual()` 继续只优化未冻结参数
+
+5. **实验流程**（`src/experiment.py`, `scripts/train.py`）
+   - 新增 `run_single_trial_dual()`：Original → GDGU-dual → Retrain（3 方法，GIF/IDEA 延后至 V5.1）
+   - Retrain baseline 也使用双通道架构，保证公平对比
+   - `scripts/train.py` 新增 `--dual` 开关；输出文件前缀 `34bus_dual_*`
+
+6. **配置文件**（`config/34bus.yaml`）
+   - 新增 `dual_channel:` 段：`graph_feat_dim`、`graph_mlp_hidden`、`graph_mlp_out`、`alpha`、`beta`
+
+### 架构 —— 方案 A（严格隔离）
+
+```
+输入：x [N, 48] + graph_feat [120]
+
+Node 通道 (GNN, BN)：                    Graph 通道 (MLP, LayerNorm)：
+  GCN/GAT/GIN backbone                     120 → 64 → 32
+    ↓ encode() → node_emb [B, 2*hid]        ↓ graph_emb_feat [B, 32]
+    ↓                                        ↓
+  Loc Head  → y_loc [B, K]                Det Head → y_det [B]
+  （只服务定位）                           （只服务检测）
+
+遗忘时：冻结 graph_mlp + det_head → 只有 Node 通道 + Loc Head 被 GDGU 更新。
+检测能力由架构保证不被破坏。
+```
+
+### Smoke-test 结果（GIN × S1-0 × seed 42，单 trial）
+
+| 方法 | ExMatch | Macro ROC | Macro F1 | Det Acc | MIA_forget | 时间 |
+|---|---|---|---|---|---|---|
+| Original   | 0.840 | 0.978 | 0.931 | 0.883 | — | 33.9s |
+| GDGU-dual  | 0.850 | 0.983 | 0.942 | 0.883 | **0.621** | 7.7s |
+| Retrain    | 0.840 | 0.986 | 0.939 | 0.883 | 0.638 | 56.8s |
+
+观察：
+- Pipeline 端到端打通，无报错
+- Detection Acc 在 Original / GDGU / Retrain 三者间完全相同（0.883）—— 证明 graph 通道被正确保留
+- GDGU-dual 的 MIA_forget（0.621）在此单 seed 低于 Retrain（0.638）—— 趋势支持假设，但需多 seed 验证
+- GDGU 相对 Retrain 加速 7.3×
+
+### 待验证项
+
+- GIN × S1-0 跑 10 seeds，获得统计显著的 MIA 对比
+- 与 V2.0 单通道并行对照（同 seed 42），以分离双通道架构贡献
+- 假设成立后扩展到 3 backbones × 4 scenarios × 4 k-hops
+
+### 文件变更（相对于 V4.0）
+
+- `src/models.py` —— GCN/GAT/GIN 三类增加 `encode()` 方法；新增 `DualChannel_Graph` 类
+- `src/data.py` —— 新增 `build_graph_features()`、`fit_graph_feat_scaler()`；`build_graphs()` 支持 graph_feat/y_det；`load_evcs_data()` 返回 `all_V`
+- `src/training.py` —— 新增 `train_model_dual()`、`evaluate_model_dual()`、`compute_mia_auc_dual()`
+- `src/unlearning.py` —— 新增 `gdgu_dual_unlearn()`（冻结 graph 通道）
+- `src/experiment.py` —— 新增 `run_single_trial_dual()` 和 `_build_result_dual()`
+- `config/34bus.yaml` —— 新增 `dual_channel:` 段
+- `scripts/train.py` —— 新增 `--dual` 开关
 
 ---
 

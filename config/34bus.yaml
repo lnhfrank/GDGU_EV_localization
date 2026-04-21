@@ -38,4 +38,11 @@ gif:                       # GIF & IDEA shared hyperparameters
 experiment:
   seeds:     [42, 77, 88, 124, 137, 226, 347, 499, 666, 999]
   backbones: [GAT, GCN, GIN]
-  k_hops:    [0, 1, 2, 3]        # k-hop neighbor expansion for forget set
+  k_hops:    [0]        # k-hop neighbor expansion for forget set
+
+dual_channel:                    # Scheme A: strict-isolation dual-channel model
+  graph_feat_dim:   120          # TempGrad 72 + EdgeGrad-light 48
+  graph_mlp_hidden: 64
+  graph_mlp_out:    32
+  alpha:            1.0          # detection loss weight
+  beta:             1.0          # localization loss weight

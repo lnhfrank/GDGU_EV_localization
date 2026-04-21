@@ -92,17 +92,21 @@ def _scenario_sort_key(s):
     return (int(s[1:]), -1)
 
 
-def load_results(results_dir, bus_system='123bus'):
+def load_results(results_dir, bus_system='123bus', tag=None):
     """Load raw CSV from a date-named results folder.
 
     Args:
         results_dir: path to date folder, e.g. '.../results/2026-04-07'.
         bus_system:  '34bus' or '123bus'.
+        tag:         Optional filename tag appended to bus_system.  For
+                     example tag='dual' loads '{bus_system}_dual_results_raw.csv'.
+                     Default None loads '{bus_system}_results_raw.csv'.
 
     Returns:
         df, scenarios, backbones
     """
-    csv_path = os.path.join(results_dir, f'{bus_system}_results_raw.csv')
+    prefix = bus_system if tag is None else f'{bus_system}_{tag}'
+    csv_path = os.path.join(results_dir, f'{prefix}_results_raw.csv')
     df = pd.read_csv(csv_path)
 
     scen_keys = sorted(df.Scenario.unique(), key=_scenario_sort_key)
@@ -578,6 +582,158 @@ def plot_khop_comparison(df, filepath, backbones, metric_col='MIA_AUC',
         out_path = f'{base}_{base_sn}{ext}'
         _savefig(fig, out_path)
         plt.show()
+
+
+# ============================================================
+#  Dual-channel (Scheme A) plots
+# ============================================================
+def plot_det_preservation(df_dual, filepath, scenarios, backbones,
+                          metric='Det_Acc', ylabel='Detection Accuracy',
+                          ylim=(0.0, 1.0)):
+    """Detection-metric preservation bar chart for dual-channel experiments.
+
+    Shows that Det_Acc / Det_AUC / Det_F1 stay stable across
+    Original / GDGU / GIF / IDEA / Retrain, confirming that the graph
+    channel is correctly frozen during unlearning.
+    """
+    S = STYLE
+    if metric not in df_dual.columns:
+        print(f'[plot_det_preservation] {metric} not found in df — skipping.')
+        return
+    methods = _available_methods(df_dual)
+    n_methods = len(methods)
+    width = 0.8 / n_methods
+
+    fig, axes = plt.subplots(1, len(backbones), figsize=(18, 5), sharey=True)
+    if len(backbones) == 1:
+        axes = [axes]
+    scen_keys = list(scenarios.keys())
+    labels = _scen_labels(scenarios)
+
+    for ax_idx, bb in enumerate(backbones):
+        ax = axes[ax_idx]
+        x = np.arange(len(scen_keys))
+        for m_idx, method in enumerate(methods):
+            offset = (m_idx - (n_methods - 1) / 2) * width
+            means, stds = [], []
+            for sk in scen_keys:
+                sub = df_dual[(df_dual.Backbone == bb) & (df_dual.Scenario == sk)
+                              & (df_dual.Method == method)]
+                means.append(sub[metric].mean() if len(sub) > 0 else np.nan)
+                stds.append(sub[metric].std() if len(sub) > 0 else 0)
+            ax.bar(x + offset, means, width, yerr=stds,
+                   label=method, color=S['colors'][method],
+                   alpha=S['bar_alpha'], capsize=3,
+                   edgecolor=S['bar_edge_color'], linewidth=S['bar_edge_width'])
+        ax.set_title(bb, fontsize=S['fs_subtitle'], fontweight='bold')
+        ax.set_xticks(x)
+        ax.set_xticklabels(labels, fontsize=S['fs_tick'])
+        ax.tick_params(axis='y', labelsize=S['fs_tick'])
+        if ax_idx == 0:
+            ax.set_ylabel(ylabel, fontsize=S['fs_label'])
+        ax.set_ylim(ylim)
+        ax.grid(axis='y', alpha=S['grid_alpha'])
+    axes[-1].legend(fontsize=S['fs_legend'])
+    plt.suptitle(f'Dual-channel: {ylabel} preserved across methods',
+                 fontsize=S['fs_label'] + 2, fontweight='bold', y=1.02)
+    plt.tight_layout()
+    _savefig(fig, filepath)
+    plt.show()
+
+
+def plot_dual_vs_nondual_mia(df_nondual, df_dual, filepath, scenarios, backbones,
+                             mia_col='MIA_AUC'):
+    """Side-by-side MIA_forget comparison: single-channel vs dual-channel.
+
+    Each backbone gets one subplot.  X-axis = methods (GDGU/GIF/IDEA/Retrain),
+    grouped bars for non-dual vs dual.  Ideal=0.5 reference line shown.
+
+    This is the direct visualization of the Scheme A hypothesis:
+    dual-channel isolation should push MIA_forget closer to 0.5.
+    """
+    S = STYLE
+    methods = [m for m in ['GDGU', 'GIF', 'IDEA', 'Retrain']
+               if m in df_nondual.Method.unique() and m in df_dual.Method.unique()]
+
+    fig, axes = plt.subplots(1, len(backbones), figsize=(18, 5), sharey=True)
+    if len(backbones) == 1:
+        axes = [axes]
+    scen_keys = list(scenarios.keys())
+
+    for ax_idx, bb in enumerate(backbones):
+        ax = axes[ax_idx]
+        x = np.arange(len(methods))
+        width = 0.38
+
+        nd_means, nd_stds = [], []
+        d_means, d_stds = [], []
+        for method in methods:
+            nd_sub = df_nondual[(df_nondual.Backbone == bb)
+                                & (df_nondual.Method == method)
+                                & df_nondual.Scenario.isin(scen_keys)]
+            d_sub = df_dual[(df_dual.Backbone == bb)
+                            & (df_dual.Method == method)
+                            & df_dual.Scenario.isin(scen_keys)]
+            nd_means.append(nd_sub[mia_col].mean())
+            nd_stds.append(nd_sub[mia_col].std())
+            d_means.append(d_sub[mia_col].mean())
+            d_stds.append(d_sub[mia_col].std())
+
+        ax.bar(x - width / 2, nd_means, width, yerr=nd_stds,
+               label='Single-channel', color='#8D8D8D',
+               alpha=S['bar_alpha'], capsize=3,
+               edgecolor=S['bar_edge_color'], linewidth=S['bar_edge_width'])
+        ax.bar(x + width / 2, d_means, width, yerr=d_stds,
+               label='Dual-channel (Scheme A)', color='#1976D2',
+               alpha=S['bar_alpha'], capsize=3,
+               edgecolor=S['bar_edge_color'], linewidth=S['bar_edge_width'])
+
+        ax.axhline(y=0.5, color=S['ideal_line_color'], linestyle='--',
+                   alpha=0.7, label='Ideal (0.5)')
+        ax.set_title(bb, fontsize=S['fs_subtitle'], fontweight='bold')
+        ax.set_xticks(x)
+        ax.set_xticklabels(methods, fontsize=S['fs_tick'])
+        ax.tick_params(axis='y', labelsize=S['fs_tick'])
+        if ax_idx == 0:
+            ax.set_ylabel('MIA-AUC on forget set', fontsize=S['fs_label'])
+        ax.set_ylim(0.0, 1.0)
+        ax.grid(axis='y', alpha=S['grid_alpha'])
+    axes[-1].legend(fontsize=S['fs_legend'])
+    plt.suptitle('Scheme A: Dual-channel isolation vs single-channel baseline',
+                 fontsize=S['fs_label'] + 2, fontweight='bold', y=1.02)
+    plt.tight_layout()
+    _savefig(fig, filepath)
+    plt.show()
+
+
+def summarize_dual_vs_nondual(df_nondual, df_dual, metrics=None):
+    """Return a side-by-side mean±std DataFrame for Dual vs Non-dual comparison.
+
+    Grouped by (Backbone, Method).  Useful for quick numerical readout
+    alongside the bar chart.
+    """
+    metrics = metrics or ['MIA_AUC', 'MIA_forget', 'ExMatch', 'Macro_ROC',
+                           'Macro_F1', 'Time']
+    available = [m for m in metrics if m in df_nondual.columns
+                 and m in df_dual.columns]
+    rows = []
+    for bb in sorted(set(df_nondual.Backbone.unique())
+                     & set(df_dual.Backbone.unique())):
+        for method in [m for m in METHODS_ORDER
+                       if m in df_nondual.Method.unique()
+                       and m in df_dual.Method.unique()]:
+            nd = df_nondual[(df_nondual.Backbone == bb)
+                            & (df_nondual.Method == method)]
+            d = df_dual[(df_dual.Backbone == bb) & (df_dual.Method == method)]
+            row = {'Backbone': bb, 'Method': method, 'n_nondual': len(nd),
+                   'n_dual': len(d)}
+            for m in available:
+                row[f'{m}_nondual'] = f'{nd[m].mean():.3f}±{nd[m].std():.3f}' \
+                    if len(nd) > 0 else 'n/a'
+                row[f'{m}_dual'] = f'{d[m].mean():.3f}±{d[m].std():.3f}' \
+                    if len(d) > 0 else 'n/a'
+            rows.append(row)
+    return pd.DataFrame(rows)
 
 
 def plot_khop_forget_size(df, filepath, backbones, scenarios):
