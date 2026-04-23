@@ -1,24 +1,31 @@
 # Graph Unlearning for EVCS Cyber Attack Localization
 
-**Nanhong Liu** — Department of Mechanical Engineering, The University of Texas at Dallas  
-*(Extended from IDETC2026-193882: binary detection → multi-label localization)*
+**Nanhong Liu** — Department of Mechanical Engineering, The University of Texas at Dallas
+*(Extended from IDETC2026-193882: cyber attack detection → modality-level unlearning for localization)*
 
 ---
 
 ## Overview
 
-Charging Manipulation Attacks (CMAs) on EV charging stations (EVCSs) alter charging profiles to cause voltage violations. This project addresses **attack localization**: given 24-hour bus voltage snapshots on an IEEE distribution feeder, predict a **multi-hot label vector** indicating which EVCS buses are under attack — a **graph-level multi-label classification** task.
+Charging Manipulation Attacks (CMAs) on EV charging stations (EVCSs) alter charging profiles to cause voltage violations. This project addresses **attack localization**: given 24-hour bus voltage and charging-power snapshots on an IEEE distribution feeder, predict a **multi-hot label vector** indicating which EVCS buses are under attack — a **graph-level multi-label classification** task.
 
-When an EVCS owner requests data deletion (GDPR right to be forgotten), its voltage measurements must be removed from the trained GNN without full retraining. We formulate this as **node feature unlearning with edge isolation**: forget-node features are zeroed and incident edges removed, then model parameters are updated via three approximate unlearning algorithms:
+**Unlearning is reformulated under a Two-Controller data-ownership model:**
+
+- **DSO** (Distribution System Operator) owns bus voltage $V$ and topology — never revoked
+- **EVCS operator** owns charging power $P$ at its PCC meter — the only modality that can be revoked under GDPR/CCPA right-to-erasure
+
+Unlearning is therefore **modality-level**: only the $P$-channel at the revoking station is zeroed; $V$ and edges remain intact. This matches the actual data-control boundaries in cyber-physical distribution systems.
 
 | Method | Approach |
 |---|---|
 | **GDGU** | First-order gradient-difference update + BatchNorm recalibration + recovery fine-tuning |
-| **GIF** | Second-order Neumann-series H⁻¹Δ∇ correction + BatchNorm recalibration |
-| **IDEA** | GIF + recovery fine-tuning |
-| **Retrain** | Full retraining from scratch on masked data (gold-standard reference) |
+| **GIF** | Second-order Neumann-series $H^{-1}\Delta\nabla$ correction |
+| **IDEA** | Certified IF-based unlearning with bounded-norm update |
+| **Retrain-A** | Full retraining from scratch on $P$-zeroed data (physical-leakage floor) |
 
-**GNN Backbones:** GCN, GAT, GIN — 3 conv layers + BatchNorm + dropout, mean+max pooling, 2-layer MLP head.
+**Model:** Single-head GNN + 5-way attack-type auxiliary head (`AuxWrapper`). Detection is derived post-hoc as $y_{\text{det}} = \max(\sigma(y_{\text{loc}}))$.
+
+**GNN Backbones:** GCN, GAT, GIN — 3 conv layers + BatchNorm + dropout, mean+max pooling, 2-layer MLP head; 96-d input ($[V_{48}\,\|\,P_{48}]$).
 
 ---
 
@@ -30,25 +37,26 @@ When an EVCS owner requests data deletion (GDPR right to be forgotten), its volt
 ├── Version.md                    # Changelog
 ├── requirements.txt
 ├── config/
-│   ├── 34bus.yaml                # Hyperparameters for 34-bus
-│   └── 123bus.yaml               # Hyperparameters for 123-bus
+│   ├── 34bus.yaml                # Hyperparameters + route_a: section
+│   └── 123bus.yaml
 ├── src/
 │   ├── __init__.py
-│   ├── models.py                 # GCN / GAT / GIN classifiers
-│   ├── data.py                   # Data loading, graph construction, edge masking
-│   ├── training.py               # Train / evaluate / MIA
-│   ├── unlearning.py             # GDGU, GIF, IDEA implementations
-│   ├── experiment.py             # Single-trial runner (5 methods)
-│   └── visualization.py          # Result plots (Times New Roman)
+│   ├── models.py                 # GCN / GAT / GIN + AuxWrapper
+│   ├── data.py                   # A-append features, modality-forget, PyG dataset
+│   ├── training.py               # train_model, train_model_joint, evaluate_aux_acc, MIA
+│   ├── unlearning.py             # GDGU, GIF, IDEA (share single-head backbone)
+│   ├── privacy.py                # L2-a IG, L2-b ΔAUC, L2-c Recon, L2-e attack-type
+│   ├── experiment.py             # run_single_trial_route_a (5 methods)
+│   └── visualization.py          # Plots (L1 utility + L2 privacy + MIA breakdown)
 ├── scripts/
 │   └── train.py                  # CLI entry point (loads YAML)
 ├── notebooks/
-│   └── Viz_GDGU_loc.ipynb        # Post-experiment visualization
+│   └── Viz_V6.ipynb              # Post-experiment visualization
 └── results/                      # Experiment outputs — git-ignored
     └── YYYY-MM-DD_HH/
-        ├── {bus}_results_raw.csv
-        ├── {bus}_results_summary.csv
-        ├── {bus}_epoch_logs.json
+        ├── {bus}_routeA_results_raw.csv
+        ├── {bus}_routeA_results_summary.csv
+        ├── {bus}_routeA_epoch_logs.json
         └── *.pdf
 ```
 
@@ -59,7 +67,7 @@ When an EVCS owner requests data deletion (GDPR right to be forgotten), its volt
 Python 3.10, CUDA 12.1.
 
 ```bash
-conda create -n evcs_gnn python=3.10 -y && conda activate evcs_gnn
+conda create -n torch-gpu python=3.10 -y && conda activate torch-gpu
 
 pip install torch==2.5.1+cu121 --index-url https://download.pytorch.org/whl/cu121
 
@@ -88,35 +96,40 @@ Raw data is **not tracked by Git**. Source from the [PowerBench benchmark](https
 | | 34-bus | 123-bus |
 |---|---|---|
 | Nodes / Edges | 37 / 36 | 132 / 131 |
-| Node features | 24 (hourly peak voltage) | 24 |
+| Node features | **96 = V_48 + P_48** | 96 |
 | Graph instances | 2,000 | 4,000 |
-| EVCS tracked (output dim) | 3 (Bus 814, 852, 890) | 5 (Bus 25, 40, 54, 62, 76) |
+| EVCS tracked (output dim $K$) | 3 (Bus 814, 852, 890) | 5 (Bus 25, 40, 54, 62, 76) |
 | Unlearning scenarios | S1–S3 | S1–S5 |
 
-**Feature construction:** For each 5-min snapshot, compute 3-phase mean voltage per bus → reshape `(288,)` to `(24, 12)` → take hourly max → `X ∈ R^{N×24}`. Standardized via `StandardScaler` fit on training split.
+**A-append feature construction:** For each node, hourly (mean, std) over 24 hours gives 48-d per modality:
+
+$$
+(288 \text{ steps}) \xrightarrow{\text{hourly bin}} 24 \xrightarrow{\text{(mean,std)}} 48\text{ dims}, \quad
+\mathbf{x} = [V_{48}\,\|\,P_{48}] \in \mathbb{R}^{96}
+$$
+
+$V$ from 3-phase-mean bus voltage (all nodes); $P$ from EVCS charging power series (EVCS nodes only, zero elsewhere). $V$ and $P$ are standardized with **separate** `StandardScaler`s.
 
 ---
 
 ## Quick Start
 
 ```bash
-conda activate evcs_gnn
-cd Projects/4-GU_EV_loc
+conda activate torch-gpu
+cd ~/1P_WTT_NVD/Projects/4-GU_EV_loc
 
-# Run 34-bus (all backbones, reads config/34bus.yaml)
-python scripts/train.py --bus 34bus
-
-# Run 123-bus, GAT only
-python scripts/train.py --bus 123bus --backbone GAT
+python scripts/train.py --bus 34bus                    # cuda:1, all 3 backbones
+python scripts/train.py --bus 123bus --gpu 0           # cuda:0 (RTX 4090 #0)
+python scripts/train.py --bus 34bus --backbone GAT     # single-backbone run
 ```
 
-Outputs saved automatically to `results/YYYY-MM-DD_HH/`. Then open `notebooks/Viz_GDGU_loc.ipynb` to generate plots.
+Outputs saved automatically to `results/YYYY-MM-DD_HH/`. Then open `notebooks/Viz_V6.ipynb` (edit Cell 1 to set `DATE_FOLDER`) to generate all plots.
 
 ---
 
 ## Experiment Design
 
-### Unlearning Scenarios (cumulative forget set)
+### Scenarios (cumulative P-channel forget)
 
 | | S1 | S2 | S3 | S4 | S5 |
 |---|---|---|---|---|---|
@@ -127,27 +140,48 @@ Outputs saved automatically to `results/YYYY-MM-DD_HH/`. Then open `notebooks/Vi
 
 | Parameter | Value |
 |---|---|
-| Split | 70/15/15 (stratified by multi-label hash) |
+| Split | 80 / 10 / 10 (stratified by multi-label hash) |
 | Epochs / patience | 300 / 50 (val Macro ROC-AUC) |
 | Hidden dim / layers | 128 / 3 |
-| Optimizer | Adam (lr=5e-4, wd=1e-4) + ReduceLROnPlateau |
-| Loss | `BCEWithLogitsLoss(pos_weight=pw)` per-label |
+| Optimizer | Adam (lr=5e-4, wd=1e-4) + ReduceLROnPlateau (GAT lr=1e-4) |
+| Loss (joint) | BCE(loc) + γ·CE(attack_type), γ=1.0 |
 | Seeds | 10 (42, 77, 88, 124, 137, 226, 347, 499, 666, 999) |
 | GDGU damp / max_norm / finetune | 0.1 / 1.0 / 25 epochs |
 | GIF iterations / damp / scale | 50 / 0.01 / 50.0 |
 | `max_batches` (34 / 123-bus) | 22 / 30 (HVP sub-sampling to avoid OOM) |
-
-> **`max_batches`:** GIF builds two autograd graphs simultaneously with `create_graph=True`. For GAT on 123-bus, full 88-batch pass exceeds 24 GB GPU memory. Sub-sampling to 30 batches reduces peak to ~20 GB.
+| Aux head hidden / n_types | 64 / 5 |
+| IG steps | 20 |
 
 ---
 
 ## Evaluation Metrics
 
-**Utility** (on masked test set D′_test): Exact Match, Hamming Accuracy, Macro F1, Macro ROC-AUC, Per-EVCS F1/ROC-AUC.
+**L1 Utility** (on full test set): Exact Match, Hamming Accuracy, Macro F1, Macro ROC-AUC, Per-EVCS F1/ROC-AUC, F1/ROC split by forget vs retain EVCS.
 
-**Unlearning**: MIA-AUC (loss-based membership inference; target → 0.5), Time (s), Peak Memory (MB), Speedup vs. Retrain.
+**L2 Privacy** (verifies the $P$-channel was actually erased):
 
-> MIA-AUC remains elevated (~0.62–0.82) even after full Retrain due to physical power-flow correlations: neighboring buses retain residual attack signatures from the forget node, an inherent property of the grid topology.
+- **L2-b Occlusion ΔAUC** — *PRIMARY.* $\text{AUC}(P \text{ present}) - \text{AUC}(P \text{ occluded at test time})$. Retrain-A sets the floor ≈ 0; Original sits at +0.17; GDGU/IDEA reach +0.04.
+- **L2-a Integrated Gradients** — per-step attribution of logits to $P$-dims at the forget node.
+- **L2-c Reconstruction** — MLP decoder from forget-node embedding to low-dim $P$ properties.
+- **L2-e Attack-type Accuracy** — 5-way linear probe on the aux head (Nil + 4 attack types).
+
+**MIA (reference only):** MIA_forget / MIA_retain / MIA_AUC. MIA_forget remains above 0.5 even for Retrain-A because physical $V\!\to\!P$ coupling carries residual signature — an inherent grid property, not a method defect.
+
+**Efficiency:** wall-clock Time (s), Peak Memory (MB), Speedup vs Retrain-A.
+
+---
+
+## Results Headline (2026-04-22 run, mean over 10 seeds, all scenarios & backbones)
+
+| Method | 34-bus Macro-ROC | 34-bus ΔAUC | 123-bus Macro-ROC | 123-bus ΔAUC | Speedup |
+|---|---|---|---|---|---|
+| Original | 1.000 | +0.167 | 0.999 | +0.165 | — |
+| **GDGU** | **0.944** | **+0.054** | **0.913** | **+0.068** | **10–11×** |
+| GIF | 0.844 | +0.117 | 0.782 | +0.101 | 14–21× (utility collapse) |
+| **IDEA** | **0.950** | **+0.042** | **0.906** | **+0.043** | 6–8× |
+| Retrain-A | 0.986 | −0.011 | 0.942 | −0.031 | 1× (baseline) |
+
+Full per-scenario / per-backbone breakdowns: see `Version.md` and `results/2026-04-22_11/`.
 
 ---
 
@@ -155,6 +189,7 @@ Outputs saved automatically to `results/YYYY-MM-DD_HH/`. Then open `notebooks/Vi
 
 - N. Liu, R. A. Jacob, J. Zhang. "Graph Unlearning for Cyber-Resilient EV Charging Networks." *ASME IDETC-CIE 2026*, IDETC2026-193882.
 - R. A. Jacob et al. "PowerBench Dataset – Part 3." 2025. DOI: [10.5281/zenodo.15401290](https://zenodo.org/records/15401290)
+- B. Fan et al. "OpenGU: A Comprehensive Benchmark for Graph Unlearning." *PVLDB 2025* — feature-level unlearning taxonomy.
 - M. Chen et al. "Graph Unlearning." *ACM CCS 2022*.
 - J. Wu et al. "GIF: A General Graph Unlearning Strategy via Influence Function." *WWW 2023*.
 - Y. Dong et al. "IDEA: Certified Unlearning for GNNs." *ACM KDD 2024*.

@@ -12,9 +12,6 @@ results/
 .DS_Store
 Thumbs.db
 scripts/*.sbatch
-scripts/run_experiments.py
 notebooks/GDGU_EV_loc_*.ipynb
 notebooks/Privacy_Radius_Analysis.ipynb
-notebooks/Viz_GDGU_loc.ipynb
-notebooks/Viz_V6.ipynb
 scripts/smoke_A/
