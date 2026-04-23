@@ -1,7 +1,7 @@
 # Graph Unlearning for EVCS Cyber Attack Localization
 
 **Nanhong Liu** — Department of Mechanical Engineering, The University of Texas at Dallas
-*(Extended from IDETC2026-193882: binary detection → multi-label localization → modality-level unlearning)*
+*(Extended from IDETC2026-193882: cyber attack detection → modality-level unlearning for localization)*
 
 ---
 
@@ -9,7 +9,7 @@
 
 Charging Manipulation Attacks (CMAs) on EV charging stations (EVCSs) alter charging profiles to cause voltage violations. This project addresses **attack localization**: given 24-hour bus voltage and charging-power snapshots on an IEEE distribution feeder, predict a **multi-hot label vector** indicating which EVCS buses are under attack — a **graph-level multi-label classification** task.
 
-**V6.0 reformulates unlearning under a Two-Controller data-ownership model:**
+**Unlearning is reformulated under a Two-Controller data-ownership model:**
 
 - **DSO** (Distribution System Operator) owns bus voltage $V$ and topology — never revoked
 - **EVCS operator** owns charging power $P$ at its PCC meter — the only modality that can be revoked under GDPR/CCPA right-to-erasure
@@ -34,7 +34,7 @@ Unlearning is therefore **modality-level**: only the $P$-channel at the revoking
 ```
 4-GU_EV_loc/
 ├── README.md
-├── Version.md                    # Changelog (V1.0 → V6.0)
+├── Version.md                    # Changelog
 ├── requirements.txt
 ├── config/
 │   ├── 34bus.yaml                # Hyperparameters + route_a: section
@@ -49,9 +49,9 @@ Unlearning is therefore **modality-level**: only the $P$-channel at the revoking
 │   ├── experiment.py             # run_single_trial_route_a (5 methods)
 │   └── visualization.py          # Plots (L1 utility + L2 privacy + MIA breakdown)
 ├── scripts/
-│   └── train.py                  # CLI (--route A default; --no-route for legacy)
+│   └── train.py                  # CLI entry point (loads YAML)
 ├── notebooks/
-│   └── Viz_V6.ipynb              # Post-experiment visualization (V6.0)
+│   └── Viz_V6.ipynb              # Post-experiment visualization
 └── results/                      # Experiment outputs — git-ignored
     └── YYYY-MM-DD_HH/
         ├── {bus}_routeA_results_raw.csv
@@ -96,12 +96,12 @@ Raw data is **not tracked by Git**. Source from the [PowerBench benchmark](https
 | | 34-bus | 123-bus |
 |---|---|---|
 | Nodes / Edges | 37 / 36 | 132 / 131 |
-| Node features (V6.0) | **96 = V_48 + P_48** | 96 |
+| Node features | **96 = V_48 + P_48** | 96 |
 | Graph instances | 2,000 | 4,000 |
 | EVCS tracked (output dim $K$) | 3 (Bus 814, 852, 890) | 5 (Bus 25, 40, 54, 62, 76) |
 | Unlearning scenarios | S1–S3 | S1–S5 |
 
-**A-append feature construction (V6.0):** For each node, hourly (mean, std) over 24 hours gives 48-d per modality:
+**A-append feature construction:** For each node, hourly (mean, std) over 24 hours gives 48-d per modality:
 
 $$
 (288 \text{ steps}) \xrightarrow{\text{hourly bin}} 24 \xrightarrow{\text{(mean,std)}} 48\text{ dims}, \quad
@@ -118,13 +118,9 @@ $V$ from 3-phase-mean bus voltage (all nodes); $P$ from EVCS charging power seri
 conda activate torch-gpu
 cd ~/1P_WTT_NVD/Projects/4-GU_EV_loc
 
-# V6.0 Route A — default
 python scripts/train.py --bus 34bus                    # cuda:1, all 3 backbones
 python scripts/train.py --bus 123bus --gpu 0           # cuda:0 (RTX 4090 #0)
 python scripts/train.py --bus 34bus --backbone GAT     # single-backbone run
-
-# Legacy V2.0 pipeline (node-level forget, 48-d V features)
-python scripts/train.py --bus 34bus --no-route
 ```
 
 Outputs saved automatically to `results/YYYY-MM-DD_HH/`. Then open `notebooks/Viz_V6.ipynb` (edit Cell 1 to set `DATE_FOLDER`) to generate all plots.
@@ -139,8 +135,6 @@ Outputs saved automatically to `results/YYYY-MM-DD_HH/`. Then open `notebooks/Vi
 |---|---|---|---|---|---|
 | **34-bus** | Bus 814 | +852 | +890 | — | — |
 | **123-bus** | Bus 25 | +40 | +54 | +62 | +76 |
-
-k-hop neighbor expansion (V3.0) is **deprecated** in V6.0: $P$ only exists at EVCS nodes, so non-EVCS neighbors have no $P$ to revoke.
 
 ### Key Hyperparameters
 
@@ -164,14 +158,14 @@ k-hop neighbor expansion (V3.0) is **deprecated** in V6.0: $P$ only exists at EV
 
 **L1 Utility** (on full test set): Exact Match, Hamming Accuracy, Macro F1, Macro ROC-AUC, Per-EVCS F1/ROC-AUC, F1/ROC split by forget vs retain EVCS.
 
-**L2 Privacy** (V6.0 — verifies the $P$-channel was actually erased):
+**L2 Privacy** (verifies the $P$-channel was actually erased):
 
 - **L2-b Occlusion ΔAUC** — *PRIMARY.* $\text{AUC}(P \text{ present}) - \text{AUC}(P \text{ occluded at test time})$. Retrain-A sets the floor ≈ 0; Original sits at +0.17; GDGU/IDEA reach +0.04.
 - **L2-a Integrated Gradients** — per-step attribution of logits to $P$-dims at the forget node.
 - **L2-c Reconstruction** — MLP decoder from forget-node embedding to low-dim $P$ properties.
 - **L2-e Attack-type Accuracy** — 5-way linear probe on the aux head (Nil + 4 attack types).
 
-**MIA (reference only, downgraded in V6.0):** MIA_forget / MIA_retain / MIA_AUC. MIA_forget remains above 0.5 even for Retrain-A because physical $V\!\to\!P$ coupling carries residual signature — an inherent grid property, not a method defect.
+**MIA (reference only):** MIA_forget / MIA_retain / MIA_AUC. MIA_forget remains above 0.5 even for Retrain-A because physical $V\!\to\!P$ coupling carries residual signature — an inherent grid property, not a method defect.
 
 **Efficiency:** wall-clock Time (s), Peak Memory (MB), Speedup vs Retrain-A.
 
@@ -187,7 +181,7 @@ k-hop neighbor expansion (V3.0) is **deprecated** in V6.0: $P$ only exists at EV
 | **IDEA** | **0.950** | **+0.042** | **0.906** | **+0.043** | 6–8× |
 | Retrain-A | 0.986 | −0.011 | 0.942 | −0.031 | 1× (baseline) |
 
-Full per-scenario / per-backbone breakdowns: see `Version.md` V6.0 entry and `results/2026-04-22_11/`.
+Full per-scenario / per-backbone breakdowns: see `Version.md` and `results/2026-04-22_11/`.
 
 ---
 
