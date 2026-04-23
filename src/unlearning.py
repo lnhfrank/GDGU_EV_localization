@@ -46,7 +46,8 @@ def recalibrate_batchnorm(model, loader, device):
 def finetune_after_gdgu(model, train_loader, val_loader, device,
                         epochs=25, lr=1e-4, pos_weights=None):
     """Recovery fine-tuning after GDGU parameter update."""
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-4)
+    params = [p for p in model.parameters() if p.requires_grad]
+    optimizer = torch.optim.Adam(params, lr=lr, weight_decay=1e-4)
     criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weights)
     best_metric = 0.0
     best_state = copy.deepcopy(model.state_dict())
@@ -59,7 +60,7 @@ def finetune_after_gdgu(model, train_loader, val_loader, device,
             out = model(batch)
             loss = criterion(out, batch.y)
             loss.backward()
-            nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
+            nn.utils.clip_grad_norm_(params, max_norm=5.0)
             optimizer.step()
 
         # Val check — macro ROC-AUC
@@ -173,9 +174,16 @@ def _compute_grad_for_hvp(model, loader, criterion, device, max_batches=None):
 
 
 def _hvp(grad_all, model_params, h_estimate):
-    """Hessian-vector product: H·h = d/dθ [∇L(θ)·h]."""
+    """Hessian-vector product: H·h = d/dθ [∇L(θ)·h].
+
+    Uses allow_unused=True + zero-fill so it works for dual-channel models
+    where some trainable params (e.g. backbone's vestigial fc1/fc2) do
+    not appear in the loc-loss graph.
+    """
     dot = sum(torch.sum(g * h) for g, h in zip(grad_all, h_estimate))
-    return autograd_grad(dot, model_params, retain_graph=True)
+    hv = autograd_grad(dot, model_params, retain_graph=True, allow_unused=True)
+    return tuple(h if h is not None else torch.zeros_like(p)
+                 for h, p in zip(hv, model_params))
 
 
 def gif_unlearn(model, train_loader_orig, train_loader_modified,
@@ -245,4 +253,253 @@ def idea_unlearn(model, train_loader_orig, train_loader_modified,
     model = finetune_after_gdgu(model, train_loader_modified, val_loader_modified,
                                 device, epochs=finetune_epochs, lr=1e-4,
                                 pos_weights=pos_weights)
+    return model
+
+
+# ======================================================================
+#  Dual-Channel GDGU (Scheme A)
+# ======================================================================
+#
+# Key difference vs single-channel GDGU:
+#   1. Freeze graph_mlp + det_head BEFORE gradient computation, so only
+#      node-channel parameters (backbone + loc_head) receive the GDGU
+#      update. The detection capability is thus preserved by construction.
+#   2. Gradients are computed from the LOCALIZATION loss only (detection
+#      loss would contribute zero gradient to frozen params anyway, but
+#      we skip it for clarity and speed).
+#   3. BatchNorm recalibration only affects the node channel (graph MLP
+#      uses LayerNorm by design).
+# ======================================================================
+
+
+def _compute_batch_gradient_loc(model, loader, criterion_loc, device):
+    """Compute average gradient on LOCALIZATION loss only, over trainable params."""
+    model.train()
+    params = [p for p in model.parameters() if p.requires_grad]
+    total_grad = [torch.zeros_like(p) for p in params]
+    n_total = 0
+
+    for batch in loader:
+        batch = batch.to(device)
+        model.zero_grad()
+        loc_logits, _ = model(batch)
+        loss = criterion_loc(loc_logits, batch.y)
+        loss.backward()
+        for i, p in enumerate(params):
+            if p.grad is not None:
+                total_grad[i] += p.grad.clone() * batch.num_graphs
+        n_total += batch.num_graphs
+
+    return [tg / n_total for tg in total_grad]
+
+
+def _finetune_after_gdgu_dual(model, train_loader, val_loader, device,
+                              epochs=25, lr=1e-4, alpha=1.0, beta=1.0,
+                              pos_weights=None):
+    """Recovery fine-tune for dual model — optimizer only touches trainable params.
+
+    The graph channel (graph_mlp + det_head) should already be frozen by
+    the caller.  Detection loss still contributes gradients to the node
+    channel only through the loc path (graph head is frozen), but we
+    include alpha * BCE(det) in the loss for consistency with training.
+    """
+    from src.training import _compute_val_roc_dual
+    params = [p for p in model.parameters() if p.requires_grad]
+    optimizer = torch.optim.Adam(params, lr=lr, weight_decay=1e-4)
+    crit_loc = nn.BCEWithLogitsLoss(pos_weight=pos_weights)
+    crit_det = nn.BCEWithLogitsLoss()
+
+    best_metric = 0.0
+    best_state = copy.deepcopy(model.state_dict())
+
+    for _ in range(1, epochs + 1):
+        model.train()
+        for batch in train_loader:
+            batch = batch.to(device)
+            optimizer.zero_grad()
+            loc_logits, det_logits = model(batch)
+            y_det = batch.y_det.view(-1)
+            loss = beta * crit_loc(loc_logits, batch.y) \
+                 + alpha * crit_det(det_logits, y_det)
+            loss.backward()
+            nn.utils.clip_grad_norm_(params, max_norm=5.0)
+            optimizer.step()
+
+        metric = _compute_val_roc_dual(model, val_loader, device)
+        if not np.isnan(metric) and metric > best_metric:
+            best_metric = metric
+            best_state = copy.deepcopy(model.state_dict())
+
+    model.load_state_dict(best_state)
+    print(f"    Fine-tune best val macro-ROC: {best_metric:.4f}")
+    return model
+
+
+def gdgu_dual_unlearn(model, train_loader_orig, train_loader_modified,
+                     val_loader_modified, criterion_loc, device,
+                     damp=0.1, max_norm=1.0, finetune_epochs=25,
+                     alpha=1.0, beta=1.0, pos_weights=None):
+    """Dual-channel GDGU: graph channel is frozen; only node channel is updated.
+
+    Steps:
+      1. Freeze graph_mlp + det_head (requires_grad=False).
+      2. Compute grad difference on localization loss only.
+      3. First-order parameter update on node-channel params.
+      4. Recalibrate BatchNorm (node channel only; graph MLP has LayerNorm).
+      5. Fine-tune node channel on modified data.
+    """
+    # Step 1: freeze graph channel
+    model.freeze_graph_channel()
+    params = [p for p in model.parameters() if p.requires_grad]
+    n_trainable = sum(p.numel() for p in params)
+    print(f"  [Dual-GDGU] Frozen graph channel, trainable params: {n_trainable}")
+
+    # Step 2: Gradient difference on LOC loss
+    print("  Computing gradient difference (loc loss only)...")
+    grad_modified = _compute_batch_gradient_loc(model, train_loader_modified,
+                                                 criterion_loc, device)
+    grad_original = _compute_batch_gradient_loc(model, train_loader_orig,
+                                                 criterion_loc, device)
+
+    delta_grad = [gm - go for gm, go in zip(grad_modified, grad_original)]
+    delta_norm = sum(d.norm().item()**2 for d in delta_grad) ** 0.5
+    print(f"  Delta gradient norm: {delta_norm:.6f}")
+
+    if delta_norm < 1e-10:
+        print("  Delta gradient too small, skipping update")
+        return model
+
+    # Step 3: First-order update on node channel
+    update = [d / damp for d in delta_grad]
+    with torch.no_grad():
+        update_norm = sum(u.norm().item()**2 for u in update) ** 0.5
+        clip_coef = min(1.0, max_norm / (update_norm + 1e-8))
+        print(f"  Update norm: {update_norm:.6f}, clip_coef: {clip_coef:.4f}")
+        for p, u in zip(params, update):
+            if torch.isnan(u).any():
+                continue
+            p.data.add_(u, alpha=clip_coef)
+
+    # Step 4: Recalibrate BatchNorm (only backbone has BN)
+    recalibrate_batchnorm(model, train_loader_modified, device)
+
+    # Step 5: Fine-tune (graph channel stays frozen)
+    print(f"  Fine-tuning {finetune_epochs} epochs on modified data...")
+    model = _finetune_after_gdgu_dual(model, train_loader_modified,
+                                      val_loader_modified, device,
+                                      epochs=finetune_epochs, lr=1e-4,
+                                      alpha=alpha, beta=beta,
+                                      pos_weights=pos_weights)
+    return model
+
+
+# ======================================================================
+#  Dual-Channel GIF / IDEA (Scheme A, V5.1)
+# ======================================================================
+#
+# Same principles as gdgu_dual_unlearn:
+#   - Freeze graph_mlp + det_head BEFORE gradient / HVP computation so
+#     that the Neumann series acts only on node-channel parameters.
+#   - Gradients use the LOCALIZATION loss only.
+#   - BatchNorm recalibrate only affects the backbone (graph MLP uses
+#     LayerNorm).
+# IDEA adds recovery fine-tuning while keeping the graph channel frozen.
+# ======================================================================
+
+
+def _compute_grad_for_hvp_loc(model, loader, criterion_loc, device,
+                              max_batches=None):
+    """Loc-loss analog of _compute_grad_for_hvp for DualChannel_Graph.
+
+    Returns grads over the currently-trainable params (i.e. node channel
+    when graph channel is frozen by the caller).  Uses allow_unused=True
+    because the backbone's own fc1/fc2 (a vestigial single-channel head)
+    is never touched by DualChannel_Graph.forward — its grads are None
+    and we replace them with zero tensors.
+    """
+    model.train()
+    total_loss = 0.0
+    n_total = 0
+    for i, batch in enumerate(loader):
+        if max_batches is not None and i >= max_batches:
+            break
+        batch = batch.to(device)
+        loc_logits, _ = model(batch)
+        loss = criterion_loc(loc_logits, batch.y) * batch.num_graphs
+        total_loss = total_loss + loss
+        n_total += batch.num_graphs
+    avg_loss = total_loss / n_total
+    params = [p for p in model.parameters() if p.requires_grad]
+    grads = autograd_grad(avg_loss, params, create_graph=True, allow_unused=True)
+    grads = tuple(g if g is not None else torch.zeros_like(p)
+                  for g, p in zip(grads, params))
+    return grads, params
+
+
+def gif_dual_unlearn(model, train_loader_orig, train_loader_modified,
+                     criterion_loc, device,
+                     iteration=50, damp=0.01, scale=50.0, max_batches=None):
+    """Dual-channel GIF: Neumann H^{-1} applied to node channel only.
+
+    Graph channel (graph_mlp + det_head) is frozen so that HVP and the
+    parameter update touch only the backbone + loc_head.
+    """
+    # Freeze graph channel
+    model.freeze_graph_channel()
+    n_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"  [Dual-GIF] Frozen graph channel, trainable params: {n_trainable}")
+
+    print(f"  Computing gradients (create_graph=True, max_batches={max_batches})...")
+    grad_orig, params = _compute_grad_for_hvp_loc(
+        model, train_loader_orig, criterion_loc, device, max_batches=max_batches)
+    grad_mod, _ = _compute_grad_for_hvp_loc(
+        model, train_loader_modified, criterion_loc, device, max_batches=max_batches)
+
+    v = tuple(go - gm for go, gm in zip(grad_orig, grad_mod))
+    h_est = tuple(go - gm for go, gm in zip(grad_orig, grad_mod))
+
+    delta_norm = sum(vi.norm().item()**2 for vi in v) ** 0.5
+    print(f"  Delta gradient norm: {delta_norm:.6f}")
+
+    print(f"  Neumann series: {iteration} iters, damp={damp}, scale={scale}")
+    for _ in range(iteration):
+        hv = _hvp(grad_orig, params, h_est)
+        with torch.no_grad():
+            h_est = tuple(
+                vi + (1 - damp) * hi - hvi / scale
+                for vi, hi, hvi in zip(v, h_est, hv))
+
+    params_change = [h / scale for h in h_est]
+    with torch.no_grad():
+        update_norm = sum(pc.norm().item()**2 for pc in params_change) ** 0.5
+        print(f"  GIF-dual update norm: {update_norm:.6f}")
+        for p, pc in zip(params, params_change):
+            if torch.isnan(pc).any():
+                continue
+            p.data.add_(pc)
+
+    del grad_orig, grad_mod, v, h_est
+    torch.cuda.empty_cache()
+
+    recalibrate_batchnorm(model, train_loader_modified, device)
+    return model
+
+
+def idea_dual_unlearn(model, train_loader_orig, train_loader_modified,
+                      val_loader_modified, criterion_loc, device,
+                      iteration=50, damp=0.01, scale=50.0,
+                      finetune_epochs=25, alpha=1.0, beta=1.0,
+                      pos_weights=None, max_batches=None):
+    """Dual-channel IDEA = GIF-dual + recovery fine-tune with graph channel frozen."""
+    model = gif_dual_unlearn(model, train_loader_orig, train_loader_modified,
+                             criterion_loc, device,
+                             iteration=iteration, damp=damp, scale=scale,
+                             max_batches=max_batches)
+    # graph channel remains frozen from gif_dual_unlearn
+    print(f"  [Dual-IDEA] Fine-tuning {finetune_epochs} epochs on modified data...")
+    model = _finetune_after_gdgu_dual(model, train_loader_modified,
+                                      val_loader_modified, device,
+                                      epochs=finetune_epochs, lr=1e-4,
+                                      alpha=alpha, beta=beta,
+                                      pos_weights=pos_weights)
     return model
