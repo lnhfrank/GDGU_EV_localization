@@ -276,15 +276,23 @@ def plot_per_evcs_roc(df, filepath, scenarios, backbones, evcs_names=None):
     plt.show()
 
 
-def plot_mia_auc(df, filepath, scenarios, backbones):
-    """MIA-AUC bar chart (all GU methods + Retrain) with ideal=0.5 line."""
+def plot_mia_metric(df, filepath, scenarios, backbones,
+                    metric_col='MIA_AUC', ylabel='MIA-AUC'):
+    """Bar chart for one MIA column (MIA_forget / MIA_retain / MIA_AUC).
+
+    MIA_forget: approaches 0.5 means forgotten samples no longer recognizable.
+    MIA_retain: should stay high, signalling retained memory on non-forget EVCS.
+    MIA_AUC:    overall aggregate (V2.0 legacy, less informative).
+    """
     S = STYLE
-    mia_methods = [m for m in ['GDGU', 'GIF', 'IDEA', 'Retrain']
+    mia_methods = [m for m in ['GDGU', 'GIF', 'IDEA', 'Retrain', 'Retrain-A']
                    if m in df.Method.unique()]
     n_methods = len(mia_methods)
     width = 0.8 / n_methods
 
     fig, axes = plt.subplots(1, len(backbones), figsize=(18, 5), sharey=True)
+    if len(backbones) == 1:
+        axes = [axes]
     scen_keys = list(scenarios.keys())
     labels = _scen_labels(scenarios)
 
@@ -296,11 +304,12 @@ def plot_mia_auc(df, filepath, scenarios, backbones):
             means, stds = [], []
             for sk in scen_keys:
                 sub = df[(df.Backbone == bb) & (df.Scenario == sk) & (df.Method == method)]
-                means.append(sub['MIA_AUC'].mean())
-                stds.append(sub['MIA_AUC'].std())
+                means.append(sub[metric_col].mean())
+                stds.append(sub[metric_col].std())
             ax.bar(x + offset, means, width, yerr=stds,
-                   label=method, color=S['colors'][method], alpha=S['bar_alpha'],
-                   capsize=3, edgecolor=S['bar_edge_color'], linewidth=S['bar_edge_width'])
+                   label=method, color=S['colors'].get(method, '#888'),
+                   alpha=S['bar_alpha'], capsize=3,
+                   edgecolor=S['bar_edge_color'], linewidth=S['bar_edge_width'])
         ax.axhline(y=0.5, color=S['ideal_line_color'], linestyle='--', alpha=0.7,
                    label='Ideal (0.5)')
         ax.set_title(bb, fontsize=S['fs_subtitle'], fontweight='bold')
@@ -308,13 +317,31 @@ def plot_mia_auc(df, filepath, scenarios, backbones):
         ax.set_xticklabels(labels, fontsize=S['fs_tick'])
         ax.tick_params(axis='y', labelsize=S['fs_tick'])
         if ax_idx == 0:
-            ax.set_ylabel('MIA-AUC', fontsize=S['fs_label'])
+            ax.set_ylabel(ylabel, fontsize=S['fs_label'])
         ax.set_ylim(0.0, 1.0)
         ax.grid(axis='y', alpha=S['grid_alpha'])
     axes[-1].legend(fontsize=S['fs_legend'])
     plt.tight_layout()
     _savefig(fig, filepath)
     plt.show()
+
+
+def plot_mia_auc(df, filepath, scenarios, backbones):
+    """Backward-compatible wrapper: plots MIA_AUC (overall)."""
+    plot_mia_metric(df, filepath, scenarios, backbones,
+                    metric_col='MIA_AUC', ylabel='MIA-AUC (overall)')
+
+
+def plot_mia_forget(df, filepath, scenarios, backbones):
+    """MIA on forget EVCS labels only.  Closer to 0.5 = stronger erasure."""
+    plot_mia_metric(df, filepath, scenarios, backbones,
+                    metric_col='MIA_forget', ylabel='MIA-AUC (forget)')
+
+
+def plot_mia_retain(df, filepath, scenarios, backbones):
+    """MIA on retained EVCS labels.  Should stay high (utility preserved)."""
+    plot_mia_metric(df, filepath, scenarios, backbones,
+                    metric_col='MIA_retain', ylabel='MIA-AUC (retain)')
 
 
 def plot_time_comparison(df, filepath, scenarios, backbones):
@@ -842,3 +869,181 @@ def plot_all(df, output_dir, scenarios, backbones, bus_system='34bus'):
         plot_khop_forget_size(df, j('khop_forget_size'), backbones, scenarios)
 
     print(f"\nAll figures saved to {output_dir}/ (prefix: {bus_system}_)")
+
+
+# ============================================================
+#  V6.0 Route A plots
+# ============================================================
+def plot_l2b_delta_auc(df, filepath, scenarios, backbones):
+    """L2-b Occlusion delta-AUC bar chart — PRIMARY privacy metric.
+
+    Positive delta = model relies on P at forget node.
+    Near-zero delta after unlearning = successful P erasure.
+    """
+    S = STYLE
+    if 'L2b_delta_auc' not in df.columns:
+        print('  [skip] L2b_delta_auc not found — skipping L2-b plot')
+        return
+    methods = _available_methods(df)
+    n_methods = len(methods)
+    width = 0.8 / n_methods
+
+    fig, axes = plt.subplots(1, len(backbones), figsize=(18, 5), sharey=True)
+    if len(backbones) == 1:
+        axes = [axes]
+    scen_keys = list(scenarios.keys())
+    labels = _scen_labels(scenarios)
+    for ax_idx, bb in enumerate(backbones):
+        ax = axes[ax_idx]
+        x = np.arange(len(scen_keys))
+        for m_idx, method in enumerate(methods):
+            offset = (m_idx - (n_methods - 1) / 2) * width
+            means, stds = [], []
+            for sk in scen_keys:
+                sub = df[(df.Backbone == bb) & (df.Scenario == sk) & (df.Method == method)]
+                means.append(sub['L2b_delta_auc'].mean())
+                stds.append(sub['L2b_delta_auc'].std())
+            ax.bar(x + offset, means, width, yerr=stds,
+                   label=method, color=S['colors'][method], alpha=S['bar_alpha'],
+                   capsize=3, edgecolor=S['bar_edge_color'], linewidth=S['bar_edge_width'])
+        ax.axhline(y=0.0, color='gray', linestyle='--', alpha=0.5)
+        ax.set_title(bb, fontsize=S['fs_subtitle'], fontweight='bold')
+        ax.set_xticks(x)
+        ax.set_xticklabels(labels, fontsize=S['fs_tick'])
+        ax.tick_params(axis='y', labelsize=S['fs_tick'])
+        if ax_idx == 0:
+            ax.set_ylabel(r'L2-b $\Delta$AUC (P reliance)', fontsize=S['fs_label'])
+        ax.grid(axis='y', alpha=S['grid_alpha'])
+    axes[-1].legend(fontsize=S['fs_legend'])
+    plt.tight_layout()
+    _savefig(fig, filepath)
+    plt.show()
+
+
+def plot_aux_accuracy(df, filepath, scenarios, backbones):
+    """Auxiliary attack-type head accuracy bar chart.
+
+    Original should be high (model sees P); Retrain-A shows physical leakage
+    floor (V-only); GU methods should approach Retrain-A.
+    """
+    S = STYLE
+    if 'Aux_Acc' not in df.columns:
+        print('  [skip] Aux_Acc not found — skipping aux accuracy plot')
+        return
+    methods = _available_methods(df)
+    n_methods = len(methods)
+    width = 0.8 / n_methods
+
+    fig, axes = plt.subplots(1, len(backbones), figsize=(18, 5), sharey=True)
+    if len(backbones) == 1:
+        axes = [axes]
+    scen_keys = list(scenarios.keys())
+    labels = _scen_labels(scenarios)
+    for ax_idx, bb in enumerate(backbones):
+        ax = axes[ax_idx]
+        x = np.arange(len(scen_keys))
+        for m_idx, method in enumerate(methods):
+            offset = (m_idx - (n_methods - 1) / 2) * width
+            means, stds = [], []
+            for sk in scen_keys:
+                sub = df[(df.Backbone == bb) & (df.Scenario == sk) & (df.Method == method)]
+                means.append(sub['Aux_Acc'].mean())
+                stds.append(sub['Aux_Acc'].std())
+            ax.bar(x + offset, means, width, yerr=stds,
+                   label=method, color=S['colors'][method], alpha=S['bar_alpha'],
+                   capsize=3, edgecolor=S['bar_edge_color'], linewidth=S['bar_edge_width'])
+        ax.axhline(y=0.2, color=S['ideal_line_color'], linestyle='--', alpha=0.6,
+                   label='Chance (1/5)')
+        ax.set_title(bb, fontsize=S['fs_subtitle'], fontweight='bold')
+        ax.set_xticks(x)
+        ax.set_xticklabels(labels, fontsize=S['fs_tick'])
+        ax.tick_params(axis='y', labelsize=S['fs_tick'])
+        if ax_idx == 0:
+            ax.set_ylabel('Attack-Type Accuracy', fontsize=S['fs_label'])
+        ax.set_ylim(0.0, 1.0)
+        ax.grid(axis='y', alpha=S['grid_alpha'])
+    axes[-1].legend(fontsize=S['fs_legend'])
+    plt.tight_layout()
+    _savefig(fig, filepath)
+    plt.show()
+
+
+def plot_l2_heatmap(df, filepath, scenarios, backbones,
+                    metric='L2b_delta_auc', title='L2-b delta-AUC'):
+    """Heatmap: methods (x) x backbones (y), one figure per scenario."""
+    S = STYLE
+    if metric not in df.columns:
+        print(f'  [skip] {metric} not found — skipping heatmap')
+        return
+    methods = _available_methods(df)
+    scen_keys = list(scenarios.keys())
+
+    for sk in scen_keys:
+        mat = np.full((len(backbones), len(methods)), np.nan)
+        for bi, bb in enumerate(backbones):
+            for mi, method in enumerate(methods):
+                sub = df[(df.Backbone == bb) & (df.Scenario == sk) & (df.Method == method)]
+                if len(sub) > 0:
+                    mat[bi, mi] = sub[metric].mean()
+
+        fig, ax = plt.subplots(figsize=(max(6, len(methods) * 1.2),
+                                        max(3, len(backbones) * 0.8 + 1)))
+        cmap = 'RdYlGn_r' if 'delta' in metric.lower() else 'RdYlGn'
+        im = ax.imshow(mat, cmap=cmap, aspect='auto')
+        ax.set_xticks(np.arange(len(methods)))
+        ax.set_xticklabels(methods, fontsize=S['fs_tick'] - 2)
+        ax.set_yticks(np.arange(len(backbones)))
+        ax.set_yticklabels(backbones, fontsize=S['fs_tick'] - 2)
+
+        for bi in range(len(backbones)):
+            for mi in range(len(methods)):
+                if not np.isnan(mat[bi, mi]):
+                    ax.text(mi, bi, f'{mat[bi, mi]:.3f}',
+                            ha='center', va='center', fontsize=S['fs_annotation'],
+                            fontweight='bold')
+
+        ax.set_title(f'{title} — {sk}', fontsize=S['fs_subtitle'], fontweight='bold')
+        fig.colorbar(im, ax=ax, shrink=0.8)
+        plt.tight_layout()
+
+        base, ext = os.path.splitext(filepath)
+        _savefig(fig, f'{base}_{sk}{ext}')
+        plt.show()
+
+
+def plot_all_v6(df, output_dir, scenarios, backbones, bus_system='34bus'):
+    """Generate all V6.0 Route A figures.
+
+    Calls standard L1 plots (shared with V2.0) + V6.0-specific L2 privacy plots.
+    """
+    os.makedirs(output_dir, exist_ok=True)
+    fmt = STYLE['save_fmt']
+    j = lambda name: os.path.join(output_dir, f'{bus_system}_{name}.{fmt}')
+
+    # L1 utility plots
+    plot_metric_bars(df, 'ExMatch', 'Exact Match Accuracy', (0.0, 1.0),
+                     j('ExMatch_comparison'), scenarios, backbones)
+    plot_metric_bars(df, 'Macro_ROC', 'Macro ROC-AUC', (0.4, 1.0),
+                     j('MacroROC_comparison'), scenarios, backbones)
+    plot_metric_bars(df, 'Macro_F1', 'Macro F1', (0.0, 1.0),
+                     j('MacroF1_comparison'), scenarios, backbones)
+    plot_metric_lines(df, 'Macro_ROC', 'Macro ROC-AUC', (0.4, 1.0),
+                      j('MacroROC_trend'), scenarios, backbones)
+    plot_per_evcs_roc(df, j('PerEVCS_ROC_breakdown'), scenarios, backbones)
+    plot_mia_auc(df, j('MIA_AUC_comparison'), scenarios, backbones)
+    plot_mia_forget(df, j('MIA_forget_comparison'), scenarios, backbones)
+    plot_mia_retain(df, j('MIA_retain_comparison'), scenarios, backbones)
+    plot_f1_vs_mia(df, j('F1_vs_MIA_tradeoff'), scenarios, backbones)
+    plot_gu_comparison(df, j('GU_method_comparison'), scenarios, backbones)
+    plot_time_comparison(df, j('Time_comparison'), scenarios, backbones)
+    plot_memory_usage(df, j('Memory_usage'), scenarios, backbones)
+
+    # V6.0 L2 privacy plots
+    plot_l2b_delta_auc(df, j('L2b_delta_auc'), scenarios, backbones)
+    plot_aux_accuracy(df, j('Aux_accuracy'), scenarios, backbones)
+    plot_l2_heatmap(df, j('L2b_heatmap'), scenarios, backbones,
+                    metric='L2b_delta_auc', title='L2-b delta-AUC')
+    plot_l2_heatmap(df, j('Aux_heatmap'), scenarios, backbones,
+                    metric='Aux_Acc', title='Aux Attack-Type Accuracy')
+
+    print(f"\nAll V6.0 figures saved to {output_dir}/ (prefix: {bus_system}_)")

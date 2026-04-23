@@ -40,9 +40,16 @@ experiment:
   backbones: [GAT, GCN, GIN]
   k_hops:    [0]        # k-hop neighbor expansion for forget set
 
-dual_channel:                    # Scheme A: strict-isolation dual-channel model
-  graph_feat_dim:   120          # TempGrad 72 + EdgeGrad-light 48
+route_a:                         # V6.0: single-head + aux attack-type head
+  gamma:            0.5          # aux loss weight: L = L_loc + gamma * L_type
+  n_attack_types:   5            # Nil + 4 attack types
+  aux_hidden:       64           # aux head hidden dim
+  ig_steps:         50           # Integrated Gradients steps (production)
+  lr_gat:           1.0e-4       # GAT-specific lr (others use training.lr)
+
+dual_channel:                    # V5.0 archived — not used by --route A
+  graph_feat_dim:   120
   graph_mlp_hidden: 64
   graph_mlp_out:    32
-  alpha:            1.0          # detection loss weight
-  beta:             1.0          # localization loss weight
+  alpha:            1.0
+  beta:             1.0

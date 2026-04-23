@@ -307,3 +307,86 @@ def fit_scaler(all_x, idx_train):
 def fit_graph_feat_scaler(graph_feat, idx_train):
     """Fit StandardScaler on per-graph features ([G, F]) using train subset."""
     return StandardScaler().fit(graph_feat[idx_train])
+
+
+# ======================================================================
+#  V6.0 Route A: A-append data pipeline
+# ======================================================================
+
+TYPE_MAP = {"Nil": 0, "Type 1": 1, "Type 2": 2, "Type 3": 3, "Type 4": 4}
+
+
+def _load_raw_pkl(pkl_paths):
+    """Load raw scenario list from pkl/pkl.gz file(s)."""
+    if isinstance(pkl_paths, str):
+        pkl_paths = [pkl_paths]
+    raw = []
+    for p in pkl_paths:
+        if p.endswith('.gz'):
+            with gzip.open(p, 'rb') as f:
+                raw.extend(pickle.load(f))
+        else:
+            with open(p, 'rb') as f:
+                raw.extend(pickle.load(f))
+    return raw
+
+
+def augment_route_a(data_dict, pkl_paths):
+    """Extend load_evcs_data output with P features and attack-type labels.
+
+    Adds keys: all_x_P [G, N, 48], all_attack_type [G], evcs_node_indices [K].
+    """
+    raw = _load_raw_pkl(pkl_paths)
+    evcs_node_indices = [
+        data_dict['bus_to_idx'][data_dict['evcs_map'][nm]]
+        for nm in data_dict['evcs_names']
+    ]
+    G = len(raw)
+    n_nodes = data_dict['n_nodes']
+
+    all_x_P = np.zeros((G, n_nodes, 48), dtype=np.float32)
+    for gi, s in enumerate(raw):
+        for evcs_1based, p_series in s["EVCS power series"].items():
+            idx0 = evcs_1based - 1
+            node_idx = evcs_node_indices[idx0]
+            p = np.asarray(p_series, dtype=np.float32).reshape(24, 12)
+            all_x_P[gi, node_idx, :24] = p.mean(axis=1)
+            all_x_P[gi, node_idx, 24:] = p.std(axis=1)
+
+    all_attack_type = np.array(
+        [TYPE_MAP[s["Attack Type"]] for s in raw], dtype=np.int64)
+
+    data_dict['all_x_P'] = all_x_P
+    data_dict['all_attack_type'] = all_attack_type
+    data_dict['evcs_node_indices'] = evcs_node_indices
+    return data_dict
+
+
+def build_graphs_route_a(all_x_V, all_x_P, all_y, all_attack_type,
+                          edge_index, n_nodes, idx,
+                          scaler_V, scaler_P,
+                          forget_P_at_node=None):
+    """Build PyG Data list for Route A (A-append [V_48|P_48], optional P zeroing).
+
+    Args:
+        forget_P_at_node: if int, zero dims 48:96 at this node for every graph.
+    """
+    n = len(idx)
+    xV = all_x_V[idx]
+    xP = all_x_P[idx]
+    v = scaler_V.transform(xV.reshape(n, -1)).reshape(n, n_nodes, 48).astype(np.float32)
+    p = scaler_P.transform(xP.reshape(n, -1)).reshape(n, n_nodes, 48).astype(np.float32)
+    x = np.concatenate([v, p], axis=2)
+
+    if forget_P_at_node is not None:
+        x[:, forget_P_at_node, 48:] = 0.0
+
+    ds = []
+    for i in range(n):
+        ds.append(Data(
+            x=torch.tensor(x[i], dtype=torch.float),
+            edge_index=edge_index.clone(),
+            y=torch.tensor(all_y[idx[i]], dtype=torch.float).unsqueeze(0),
+            y_type=torch.tensor([all_attack_type[idx[i]]], dtype=torch.long),
+        ))
+    return ds

@@ -136,6 +136,64 @@ MODEL_CLASSES = {
 
 
 # ======================================================================
+#  AuxWrapper — V6.0 Route A: adds 5-way attack-type auxiliary head
+# ======================================================================
+
+class AuxWrapper(nn.Module):
+    """Wraps any single-head GNN with an auxiliary attack-type classification head.
+
+    forward()      -> loc_logits only (compatible with existing unlearning code)
+    forward_both() -> (loc_logits, type_logits) for joint training
+    forward_aux()  -> type_logits for evaluation
+    """
+
+    def __init__(self, backbone, n_types=5, aux_hidden=64):
+        super().__init__()
+        self.backbone = backbone
+        D = backbone.fc1.in_features
+        self.aux_head = nn.Sequential(
+            nn.Linear(D, aux_hidden), nn.ReLU(), nn.Linear(aux_hidden, n_types),
+        )
+
+    @property
+    def convs(self):
+        return self.backbone.convs
+
+    @property
+    def bns(self):
+        return self.backbone.bns
+
+    @property
+    def hid_dim(self):
+        return self.backbone.hid_dim
+
+    def encode(self, data):
+        return self.backbone.encode(data)
+
+    def forward(self, data):
+        return self.backbone(data)
+
+    def forward_both(self, data):
+        emb = self.backbone.encode(data)
+        h = F.relu(self.backbone.fc1(emb))
+        h = F.dropout(h, p=self.backbone.dropout, training=self.training)
+        loc = self.backbone.fc2(h)
+        typ = self.aux_head(emb)
+        return loc, typ
+
+    def forward_aux(self, data):
+        return self.aux_head(self.backbone.encode(data))
+
+    def freeze_aux(self):
+        for p in self.aux_head.parameters():
+            p.requires_grad = False
+
+    def unfreeze_aux(self):
+        for p in self.aux_head.parameters():
+            p.requires_grad = True
+
+
+# ======================================================================
 #  Dual-Channel Model (Scheme A: strict isolation)
 # ======================================================================
 #

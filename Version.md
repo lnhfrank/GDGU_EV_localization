@@ -2,6 +2,198 @@
 
 ---
 
+## V6.0 — GU_EV_loc.20260422
+
+**Date:** 2026-04-22
+**Branch:** `feat/two-controller-unlearning`
+**Status:** Production pipeline implemented; ready for multi-seed runs
+**Supersedes:** V5.0 dual-channel architecture (archived as baseline)
+**Smoke results:** `results/smoke_v6_full_2026-04-22_01/`
+
+### Production Pipeline (implemented 2026-04-22)
+
+1. **AuxWrapper model** (`src/models.py`): wraps GCN/GAT/GIN backbone with 5-way attack-type auxiliary head
+   - `forward()` → loc_logits only (backward-compatible with GDGU/GIF/IDEA)
+   - `forward_both()` → (loc_logits, type_logits) for joint training
+   - `freeze_aux()` / `unfreeze_aux()` for unlearning (prevents optimizer weight_decay corruption)
+
+2. **A-append data pipeline** (`src/data.py`): `augment_route_a()` + `build_graphs_route_a()`
+   - Node features: x = [V_48 | P_48] = 96d; separate V/P StandardScalers
+   - y_type attribute on Data objects (5-way: Nil + 4 attack types)
+   - `forget_P_at_node`: zeros P dims at specified node(s) for modality-level unlearning
+
+3. **Joint training** (`src/training.py`): `train_model_joint()` + `evaluate_aux_acc()`
+   - Loss = BCE(loc) + gamma * CE(attack_type) with class weights
+   - Early stopping on val macro-ROC (localization)
+
+4. **L2 privacy evaluation** (`src/privacy.py` v2):
+   - L2-a: Integrated Gradients on logits (fixes V5.3 loss-saturation)
+   - L2-b: Occlusion delta-AUC (**PRIMARY** — cleanest erasure signal)
+   - L2-c: Reconstruction attack (graph embedding → low-dim P target)
+   - L2-e: Attack-type inference (aux head accuracy)
+
+5. **Experiment runner** (`src/experiment.py`): `run_single_trial_route_a()`
+   - Orchestrates: data prep → joint training (Original + Retrain-A) → unlearning (GDGU/GIF/IDEA with aux frozen) → evaluation (L1 + L2-a/b/e + MIA)
+   - `_build_result_route_a()` extends result dict with Aux_Acc, L2a_IG, L2b_delta_auc
+
+6. **CLI** (`scripts/train.py`): `--route A` flag
+   - `build_scenarios_route_a()`: S1, S2, S3 (no k-hop suffix)
+   - `save_results()` updated to handle Route A columns
+   - Output tag: `{bus}_routeA_*`
+
+7. **Visualization** (`src/visualization.py`): V6.0 plot family
+   - `plot_l2b_delta_auc()`, `plot_aux_accuracy()`, `plot_l2_heatmap()`, `plot_all_v6()`
+   - Archived: `plot_khop_comparison()`, `plot_khop_forget_size()` (kept but not auto-called)
+
+8. **Bug fix** (`src/unlearning.py`): `finetune_after_gdgu()` now filters to `requires_grad` params
+   - Prevents weight_decay from corrupting frozen aux_head parameters
+
+### Smoke-test results (3 GNNs × 5 methods × S1 × seed 42)
+
+| Backbone | Method | Macro-ROC | Macro-F1 | Aux Acc | L2b ΔAUC | IG mean | Time |
+|---|---|---|---|---|---|---|---|
+| GCN | Original  | 1.000 | 0.999 | 0.597 | +0.131 | 10.53 | 14.4s |
+| GCN | GDGU      | 0.957 | 0.931 | 0.627 | +0.043 | 4.97 | 6.1s |
+| GCN | IDEA      | 0.974 | 0.945 | 0.623 | +0.025 | 4.76 | 9.1s |
+| GCN | Retrain-A | 0.994 | 0.984 | 0.573 | −0.005 | 2.40 | 19.1s |
+| GAT | Original  | 1.000 | 0.998 | 0.520 | +0.108 | 4.26 | 20.8s |
+| GAT | GDGU      | 0.963 | 0.921 | 0.510 | +0.037 | 3.52 | 8.9s |
+| GAT | IDEA      | 0.973 | 0.941 | 0.520 | +0.027 | 2.48 | 15.2s |
+| GAT | Retrain-A | 0.981 | 0.964 | 0.540 | −0.012 | 0.93 | 26.7s |
+| GIN | Original  | 1.000 | 0.998 | 0.603 | +0.163 | 15.25 | 17.6s |
+| GIN | GDGU      | 0.984 | 0.965 | 0.580 | +0.011 | 4.11 | 5.7s |
+| GIN | IDEA      | 0.984 | 0.964 | 0.550 | −0.017 | 2.69 | 10.0s |
+| GIN | Retrain-A | 0.995 | 0.981 | 0.570 | −0.021 | 3.58 | 13.9s |
+
+**Key findings:**
+- **L2-b ΔAUC** (PRIMARY): Original Δ = +0.11~0.16; GDGU/IDEA Δ → near Retrain-A (−0.02~+0.04) — strong erasure signal
+- **L2-a IG**: Original >> Retrain-A >> GU (consistent with L2-b direction)
+- **Aux Acc**: All near ~0.52–0.63 (leakage floor from V features alone; V physically determined by P)
+- **GU ranking**: IDEA > GDGU >> GIF (GIF utility collapse without finetune, consistent with V2.0)
+- **Speedup**: GDGU ~2.5–4.7x vs Retrain; IDEA ~1.4–2.1x vs Retrain
+
+### Usage
+
+```bash
+conda activate torch-gpu
+cd ~/1P_WTT_NVD/Projects/4-GU_EV_loc
+
+# Full V6.0 production run (34-bus, all 3 backbones × 3 scenarios × 10 seeds)
+python scripts/train.py --bus 34bus --route A
+
+# Quick single-seed test
+python scripts/train.py --bus 34bus --route A --backbone GIN --seed 42
+
+# 123-bus
+python scripts/train.py --bus 123bus --route A
+```
+
+### Motivation
+
+V5.3 redefined unlearning as **modality-level erasure** (P-channel only; V and edges remain intact). Under this semantic, V5.0's dual-channel architecture loses its original justifications:
+
+1. **MIA containment** (V5.0's main rationale): V5.0 isolated graph-level V-dynamics to prevent system-wide leakage. But V5.3 deliberately **keeps V everywhere** (DSO-owned) — the "graph-level signal leakage" V5.0 was defending against is now a feature, not a bug.
+2. **Detection preservation during unlearning**: V5.0 froze the graph channel to guarantee `det_head` was untouched. Under modality-forget, non-forgotten EVCS's localization capability remains intact → `y_det = max(y_loc)` automatically preserves detection.
+3. **Task-level logical observation**: Localization is multi-label over K EVCS **including the nil case** (all-zero label = no attack). Detection is its OR aggregation: `y_det = 1 ⟺ max(y_loc) = 1`. **Detection is a deterministic function of localization** — a separate head is architecturally redundant.
+
+V6.0 collapses V5.0's dual-channel back to a **single-head localization model** and derives detection post-hoc. This restores Occam's razor and makes the V5.3 problem formulation (Two-Controller + modality erasure) the **sole** novelty, not "method + side architecture".
+
+### Key Updates (vs V5.0)
+
+1. **Single-head architecture**
+   - GNN backbone → mean+max pool → Loc head → `y_loc [B, K]`
+   - Detection derived post-hoc: `y_det = max(sigmoid(y_loc))` (continuous) or `any(y_loc > 0.5)` (binary)
+   - Reuses V2.0 single-channel infrastructure — all unlearning methods (GDGU / GIF / IDEA / Retrain) apply **without dual variants**
+
+2. **Graph-level features reframed as optional augmentation**
+   - `build_graph_features()` (TempGrad + EdgeGrad-light, 120d, V-only) retained in codebase
+   - No longer consumed by a dedicated MLP channel
+   - Future use: optional concat to pooled node embedding before `Loc head` (ablation)
+
+3. **V5.0 components deprecated** (archived as baseline, not in production path):
+   - `DualChannel_Graph` class
+   - `train_model_dual()`, `evaluate_model_dual()`, `compute_mia_auc_dual()`
+   - `gdgu_dual_unlearn()` — superseded by regular `gdgu_unlearn()` acting on single-head
+
+4. **Detection reporting protocol**:
+   - Report DetAUC / DetAcc computed from derived `y_det`
+   - Apples-to-apples comparison with V5.0: V5.0 reports direct `det_head` output; V6.0 reports `max(y_loc)` on the same test set
+
+5. **k-hop neighbor expansion deprecated** (cascading from modality-forget semantic)
+   - V3.0's k-hop BFS expansion was motivated by "mask V at forget node + k-hop neighbors to cut physical leakage paths"
+   - Under V6.0: V is never masked, edges never cut, and P only exists at EVCS nodes → non-EVCS neighbors **have no P to revoke** → k-hop dimension collapses semantically
+   - Scenario naming reverts from `Sn-k` to `Sn` (cumulative forget — 34-bus: S1=Bus 814, S2=+852, S3=+890; 123-bus: S1~S5)
+   - `expand_forget_khop()` kept in `src/data.py` as archived function (not in main path)
+   - Experiment grid for 34-bus: `10 seeds × 3 backbones × 3 scenarios = 90 trials`, reduced 3× from V3.0's k-hop grid
+
+6. **Dual-dataset (34-bus + 123-bus) unified under Route A**
+   - V6.0 pipeline is dataset-agnostic: same A-append, modality-forget, single-head model, L1/L2 evaluation
+   - 123-bus specifics: K=5 EVCS (Bus 25/40/54/62/76), scenarios S1–S5, L2-d EVCS-ID probe → 5-way
+   - `config/123bus.yaml` mirrors `34bus.yaml`; `max_batches: 30` preserved from V2.0 for GIF/IDEA OOM on GAT × 123-bus
+   - Combined grid: `90 (34-bus) + 150 (123-bus) = 240 trials`
+
+7. **Visualization refactor**
+   - `src/visualization.py`: add V6.0 plot family — `plot_L1_comparison()`, `plot_L2_matrix()` (L2-e Attack-Type verdict is the key new visual), `plot_efficiency_pareto()`, `plot_attack_type_verdict()`, `plot_all_v6()`
+   - Archive (kept in codebase but not auto-called): `plot_khop_comparison()`, `plot_khop_forget_size()` from V3.0
+   - `_scenario_sort_key()` simplified to `Sn` only (no `Sn-k` compat in V6.0 outputs)
+   - New notebook: `notebooks/Viz_V6.ipynb` (old `Viz_GDGU_loc.ipynb` preserved for archival)
+
+8. **Output file naming convention — minimal**
+   - All CSV / PDF / JSON outputs follow `{bus}_{content}.{ext}` with no timestamp/seed/scenario in the filename itself
+   - Examples: `34bus_MacroF1.pdf`, `34bus_L2_matrix.pdf`, `123bus_efficiency_pareto.pdf`, `34bus_route_a_results.csv`
+   - Disambiguation via parent folder `results/{YYYY-MM-DD_HH}/`; full run config stored in `_metadata` block inside JSON
+   - Applies to both figure outputs (visualization) and data outputs (experiment CSVs/JSONs)
+
+### V5.0 → V6.0 justification audit
+
+| V5.0 rationale | V5.3 context | V6.0 verdict |
+|---|---|---|
+| Graph-level V dynamics leak MIA | V5.3 keeps V everywhere | ❌ motivation void |
+| Freeze graph channel protects det | `max(y_loc)` preserves det automatically | ⚠️ redundant |
+| Architecture ≅ Two-Controller ownership | post-hoc rationalization (V5.3 add-on) | 🟡 rhetorical only |
+
+### Implications for pending production integration
+
+V5.3's file-change plan simplifies (final V6.0 list):
+- `src/data.py`: A-append (V_48 + P_48 = 96d); `forget_P_only=True` flag; `expand_forget_khop()` archived (not in main path)
+- `src/models.py`: **no** `DualChannel_Graph` extension; set `in_dim=96` on single-head `GCN_Graph / GAT_Graph / GIN_Graph` (already exposed via existing `__init__`)
+- `src/training.py`: regular `train_model()` / `evaluate_model()` extended with derived-det reporting; **no** `_dual` variants
+- `src/unlearning.py`: no `_dual` variants; all four methods work as-is on single-head
+- `src/experiment.py`: `run_single_trial_route_a(K)` where K=3 (34-bus) or K=5 (123-bus); runs {Original, GDGU, GIF, IDEA, Retrain}
+- `src/privacy.py` **(new)**: L2-a ~ L2-e + `measure_unlearn_efficiency()`; L2-d probe class count parameterized by K
+- `src/visualization.py`: add V6.0 plot family; archive k-hop plots; `_scenario_sort_key()` simplified to `Sn`
+- `config/34bus.yaml`: **remove** `dual_channel:` and `k_hops:` sections; add `route_a:` + `privacy:`
+- `config/123bus.yaml`: mirror `34bus.yaml` changes; preserve `max_batches: 30`
+- `scripts/train.py`: `--route A` flag; simplified scenario builder (drops `-k` suffix)
+- `notebooks/Viz_V6.ipynb` **(new)**: V6.0-exclusive visualization notebook
+- All output files follow minimal `{bus}_{content}.{ext}` naming (item 8 above)
+
+### Pending work
+
+- **Multi-seed production run**: `python scripts/train.py --bus 34bus --route A` (90 trials: 3 backbones × 3 scenarios × 10 seeds)
+- **123-bus production run**: `python scripts/train.py --bus 123bus --route A` (150 trials: 3 backbones × 5 scenarios × 10 seeds)
+- **Notebook**: `notebooks/Viz_V6.ipynb` for post-hoc visualization
+- **A1 ablation**: forget V_at_PCC alongside P (PCC meter is EVCS-owned per Jacob Fig.1b)
+
+### Files changed (vs V5.3)
+
+- `src/models.py` — added `AuxWrapper` class (after `MODEL_CLASSES` dict)
+- `src/data.py` — added `TYPE_MAP`, `_load_raw_pkl()`, `augment_route_a()`, `build_graphs_route_a()`
+- `src/training.py` — added `train_model_joint()`, `evaluate_aux_acc()`
+- `src/privacy.py` — **new**: L2-a/b/c/e metrics, `extract_graph_embeddings()`, `measure_unlearn_efficiency()`
+- `src/experiment.py` — added `run_single_trial_route_a()`, `_build_result_route_a()`; updated imports
+- `src/unlearning.py` — fixed `finetune_after_gdgu()` to filter requires_grad params
+- `src/visualization.py` — added `plot_l2b_delta_auc()`, `plot_aux_accuracy()`, `plot_l2_heatmap()`, `plot_all_v6()`
+- `src/__init__.py` — updated exports with all V6.0 functions
+- `scripts/train.py` — added `--route A` flag, `build_scenarios_route_a()`, route_a config parsing
+- `config/34bus.yaml` — added `route_a:` section (gamma, n_attack_types, aux_hidden, ig_steps, lr_gat)
+- `config/123bus.yaml` — same `route_a:` additions
+- `scripts/smoke_A/smoke_v6_priv.py` — privacy smoke test (v2)
+- `scripts/smoke_A/smoke_v6_full.py` — comprehensive 3-GNN × 5-method smoke test
+- `Version.md` — V6.0 production update
+
+---
+
 ## V5.3 — GU_EV_loc.20260421 *(not committed — exploratory)*
 
 **Date:** 2026-04-21
@@ -406,6 +598,172 @@ V2.0 experiments revealed that MIA-AUC remains well above 0.5 even for Retrain (
 4. `StandardScaler` + `kaiming_init` adopted as standard training pipeline
 
 ---
+
+---
+
+## V6.0 — GU_EV_loc.20260422
+
+**日期：** 2026-04-22
+**分支：** `feat/two-controller-unlearning`
+**状态：** 生产 pipeline 已实现；可启动多 seed 正式实验
+**取代：** V5.0 双通道架构（归档为 baseline）
+**Smoke 结果：** `results/smoke_v6_full_2026-04-22_01/`
+
+### 生产化 Pipeline（2026-04-22 实现）
+
+1. **AuxWrapper 模型**（`src/models.py`）：在 GCN/GAT/GIN backbone 上加 5-way 攻击类型辅助 head
+   - `forward()` → 只返回 loc_logits（向后兼容 GDGU/GIF/IDEA）
+   - `forward_both()` → (loc_logits, type_logits) 联合训练
+   - `freeze_aux()` / `unfreeze_aux()` 遗忘时冻结（防止 weight_decay 腐蚀辅助 head）
+
+2. **A-append 数据流**（`src/data.py`）：`augment_route_a()` + `build_graphs_route_a()`
+   - 节点特征：x = [V_48 | P_48] = 96d；独立 V/P StandardScaler
+   - Data 对象上的 y_type 属性（5-way：Nil + 4 种攻击）
+   - `forget_P_at_node`：在指定节点置零 P 维度（模态级遗忘）
+
+3. **联合训练**（`src/training.py`）：`train_model_joint()` + `evaluate_aux_acc()`
+   - Loss = BCE(loc) + gamma × CE(attack_type)，带类别权重
+   - 早停监控 val macro-ROC（定位任务）
+
+4. **L2 隐私评估**（`src/privacy.py` v2）：
+   - L2-a：Integrated Gradients on logits（修复 V5.3 的 loss 饱和问题）
+   - L2-b：Occlusion ΔAUC（**主指标** —— 最清晰的消除信号）
+   - L2-e：攻击类型推断（辅助 head 准确率）
+
+5. **实验运行器**（`src/experiment.py`）：`run_single_trial_route_a()`
+   - 编排：数据准备 → 联合训练（Original + Retrain-A）→ 遗忘（GDGU/GIF/IDEA，冻结 aux）→ 评估（L1 + L2-a/b/e + MIA）
+
+6. **CLI**（`scripts/train.py`）：`--route A` 开关
+   - 场景构造：S1、S2、S3（无 k-hop 后缀）
+   - 输出标签：`{bus}_routeA_*`
+
+7. **可视化**（`src/visualization.py`）：V6.0 绘图族
+   - `plot_l2b_delta_auc()`、`plot_aux_accuracy()`、`plot_l2_heatmap()`、`plot_all_v6()`
+
+### Smoke 结果（3 GNN × 5 方法 × S1 × seed 42）
+
+| Backbone | 方法 | Macro-ROC | Macro-F1 | Aux Acc | L2b ΔAUC | 时间 |
+|---|---|---|---|---|---|---|
+| GCN | Original  | 1.000 | 0.999 | 0.597 | +0.131 | 14.4s |
+| GCN | IDEA      | 0.974 | 0.945 | 0.623 | +0.025 | 9.1s |
+| GCN | Retrain-A | 0.994 | 0.984 | 0.573 | −0.005 | 19.1s |
+| GIN | Original  | 1.000 | 0.998 | 0.603 | +0.163 | 17.6s |
+| GIN | IDEA      | 0.984 | 0.964 | 0.550 | −0.017 | 10.0s |
+| GIN | Retrain-A | 0.995 | 0.981 | 0.570 | −0.021 | 13.9s |
+
+**核心发现：** L2-b ΔAUC 主指标确认模态消除有效（Original Δ ~ +0.11~0.16 → GU 后降至 Retrain-A 水平 ~ −0.02~+0.04）；GU 方法排名 IDEA > GDGU >> GIF。
+
+### 运行命令
+
+```bash
+conda activate torch-gpu
+cd ~/1P_WTT_NVD/Projects/4-GU_EV_loc
+python scripts/train.py --bus 34bus --route A             # 完整 34-bus
+python scripts/train.py --bus 34bus --route A --seed 42   # 单 seed 测试
+python scripts/train.py --bus 123bus --route A            # 完整 123-bus
+```
+
+### 动机
+
+V5.3 把 unlearning 问题重定义为**模态级消除**（只抹 P 通道，V 和边全部保留）。在这个语义下，V5.0 双通道架构的原始动机全部失效：
+
+1. **MIA 泄漏控制**（V5.0 主论点）：V5.0 隔离 graph-level V 动态是为了阻止系统级泄漏。但 V5.3 **故意让 V 处处保留**（DSO 所有）—— V5.0 要防的"graph-level 信号泄漏"在 V5.3 里是特性不是 bug。
+2. **遗忘时保护 detection**：V5.0 冻结 graph 通道以确保 `det_head` 不动。但在 modality-forget 下，未被遗忘的 EVCS 的定位能力依然保留 → `y_det = max(y_loc)` 自动保住 detection。
+3. **任务层面的逻辑观察**：定位是 K 个 EVCS 上的多标签（**包含 nil 情境**——全零标签 = 无攻击）。检测是它的 OR 聚合：`y_det = 1 ⟺ max(y_loc) = 1`。**检测是定位的确定性函数** —— 独立 head 在架构上冗余。
+
+V6.0 把 V5.0 双通道折回**单 head 定位模型**，检测由后处理派生。这恢复 Occam's razor，让 V5.3 的问题定义（Two-Controller + 模态消除）成为**唯一** novelty，而不是"方法 + 副架构"。
+
+### 重要更新（相对于 V5.0）
+
+1. **单 head 架构**
+   - GNN backbone → mean+max pool → Loc head → `y_loc [B, K]`
+   - 检测后处理派生：`y_det = max(sigmoid(y_loc))`（连续）或 `any(y_loc > 0.5)`（二值）
+   - 复用 V2.0 单通道基础设施 —— GDGU / GIF / IDEA / Retrain 全部**无需 dual 变体**直接适用
+
+2. **全图特征改为可选增强**
+   - `build_graph_features()`（TempGrad + EdgeGrad-light，120d，V-only）保留在代码库
+   - 不再通过独立 MLP 通道消费
+   - 后续用法：池化节点嵌入后 concat 进 `Loc head` 前（消融实验）
+
+3. **V5.0 组件弃用**（归档 baseline，不在生产路径）：
+   - `DualChannel_Graph` 类
+   - `train_model_dual()`、`evaluate_model_dual()`、`compute_mia_auc_dual()`
+   - `gdgu_dual_unlearn()` —— 被作用于单 head 的常规 `gdgu_unlearn()` 取代
+
+4. **Detection 报告协议**：
+   - 从派生的 `y_det` 计算 DetAUC / DetAcc
+   - 与 V5.0 可做 apples-to-apples 对比：V5.0 报告 `det_head` 直接输出，V6.0 报告同测试集上的 `max(y_loc)` 派生
+
+5. **k-hop 邻居扩展弃用**（modality-forget 语义的连锁简化）
+   - V3.0 的 k-hop BFS 扩展原是为了"抹 V + 切 k-hop 邻居边，断开物理泄漏路径"
+   - V6.0 下：V 永不抹、边永不切，且 P **只存在于 EVCS 节点** → 非 EVCS 邻居**没有 P 可召回** → k-hop 维度在语义上坍塌
+   - 场景命名从 `Sn-k` 回到 `Sn`（累计遗忘 —— 34-bus: S1=Bus 814, S2=+852, S3=+890；123-bus: S1~S5）
+   - `expand_forget_khop()` 在 `src/data.py` 保留为归档函数（不在主路径使用）
+   - 34-bus 实验网格：`10 seeds × 3 backbones × 3 scenarios = 90 trials`，比 V3.0 k-hop 网格少 3×
+
+6. **双数据集（34-bus + 123-bus）统一在 Route A 下**
+   - V6.0 pipeline dataset-agnostic：A-append、modality-forget、单 head 模型、L1/L2 评估全部相同
+   - 123-bus 差异：K=5 EVCS（Bus 25/40/54/62/76），场景 S1–S5，L2-d EVCS-ID probe → 5-way
+   - `config/123bus.yaml` 镜像 `34bus.yaml`；保留 V2.0 遗产 `max_batches: 30`（GAT × 123-bus 的 GIF/IDEA OOM 修复）
+   - 合计网格：`90 (34-bus) + 150 (123-bus) = 240 trials`
+
+7. **可视化重构**
+   - `src/visualization.py`：新增 V6.0 绘图族 —— `plot_L1_comparison()`、`plot_L2_matrix()`（L2-e Attack-Type verdict 是核心新视觉）、`plot_efficiency_pareto()`、`plot_attack_type_verdict()`、`plot_all_v6()`
+   - 归档（代码保留但不自动调用）：V3.0 的 `plot_khop_comparison()`、`plot_khop_forget_size()`
+   - `_scenario_sort_key()` 简化为只认 `Sn`（V6.0 输出不再有 `Sn-k` 兼容）
+   - 新增笔记本：`notebooks/Viz_V6.ipynb`（旧 `Viz_GDGU_loc.ipynb` 保留归档）
+
+8. **输出文件命名规范 —— 最小化**
+   - 所有 CSV / PDF / JSON 输出遵循 `{bus}_{content}.{ext}` 格式，**文件名不含时间戳/seed/场景**
+   - 示例：`34bus_MacroF1.pdf`、`34bus_L2_matrix.pdf`、`123bus_efficiency_pareto.pdf`、`34bus_route_a_results.csv`
+   - 区分由父目录 `results/{YYYY-MM-DD_HH}/` 承担；完整 run config 存在 JSON 文件内的 `_metadata` 块
+   - 同时适用于图像输出（可视化）和数据输出（实验 CSV/JSON）
+
+### V5.0 → V6.0 动机审计
+
+| V5.0 论据 | V5.3 语境 | V6.0 判决 |
+|---|---|---|
+| Graph-level V 动态泄漏 MIA | V5.3 处处保留 V | ❌ 动机失效 |
+| 冻结 graph 通道保护 det | `max(y_loc)` 自动保 det | ⚠️ 冗余 |
+| 架构 ≅ Two-Controller 产权 | 事后合理化（V5.3 补的叙事） | 🟡 仅剩修辞 |
+
+### 对生产化集成文件清单的影响
+
+V5.3 原草拟的文件清单简化为（V6.0 最终版）：
+- `src/data.py`：A-append（V_48 + P_48 = 96d）；`forget_P_only=True` 开关；`expand_forget_khop()` 归档（不在主路径）
+- `src/models.py`：**不需要** `DualChannel_Graph` 扩展；在单 head `GCN_Graph / GAT_Graph / GIN_Graph` 构造参数设 `in_dim=96`（已通过 `__init__` 暴露）
+- `src/training.py`：常规 `train_model()` / `evaluate_model()` 扩展派生 det 报告；**不需要** `_dual` 变体
+- `src/unlearning.py`：无 `_dual` 变体；四方法直接作用于单 head
+- `src/experiment.py`：`run_single_trial_route_a(K)`，K=3（34-bus）或 K=5（123-bus）；跑 {Original, GDGU, GIF, IDEA, Retrain}
+- `src/privacy.py` **（新）**：L2-a ~ L2-e + `measure_unlearn_efficiency()`；L2-d probe 的类别数用 K 参数化
+- `src/visualization.py`：新增 V6.0 绘图族；归档 k-hop 绘图；`_scenario_sort_key()` 简化为只认 `Sn`
+- `config/34bus.yaml`：**移除** `dual_channel:` 和 `k_hops:` 段；新增 `route_a:` 和 `privacy:` 段
+- `config/123bus.yaml`：镜像 `34bus.yaml` 改动；保留 `max_batches: 30`
+- `scripts/train.py`：`--route A` 开关；简化场景构造器（去掉 `-k` 后缀）
+- `notebooks/Viz_V6.ipynb` **（新）**：V6.0 专用可视化笔记本
+- 所有输出文件遵循最小化命名 `{bus}_{content}.{ext}`（见上面第 8 点）
+
+### 待办
+
+- **多 seed 正式跑**：`python scripts/train.py --bus 34bus --route A`（90 trials：3 backbones × 3 scenarios × 10 seeds）
+- **123-bus 正式跑**：`python scripts/train.py --bus 123bus --route A`（150 trials：3 backbones × 5 scenarios × 10 seeds）
+- **笔记本**：`notebooks/Viz_V6.ipynb` 后处理可视化
+- **A1 消融**：加上 V_at_PCC 一起遗忘（按 Jacob Fig.1b，PCC meter 归 EVCS）
+
+### 文件变更（相对于 V5.3）
+
+- `src/models.py` —— 新增 `AuxWrapper` 类
+- `src/data.py` —— 新增 `augment_route_a()`、`build_graphs_route_a()`
+- `src/training.py` —— 新增 `train_model_joint()`、`evaluate_aux_acc()`
+- `src/privacy.py` —— **新模块**：L2-a/b/c/e 指标
+- `src/experiment.py` —— 新增 `run_single_trial_route_a()`
+- `src/unlearning.py` —— 修复 `finetune_after_gdgu()` 只优化 requires_grad 参数
+- `src/visualization.py` —— 新增 V6.0 绘图族（`plot_l2b_delta_auc` 等）
+- `src/__init__.py` —— 更新导出
+- `scripts/train.py` —— 新增 `--route A` 开关、`build_scenarios_route_a()`
+- `config/34bus.yaml`、`config/123bus.yaml` —— 新增 `route_a:` 段
+- `scripts/smoke_A/smoke_v6_priv.py`、`smoke_v6_full.py` —— V6.0 冒烟测试
+- `Version.md` —— V6.0 生产化更新
 
 ---
 

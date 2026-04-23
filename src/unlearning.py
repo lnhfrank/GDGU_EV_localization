@@ -46,7 +46,8 @@ def recalibrate_batchnorm(model, loader, device):
 def finetune_after_gdgu(model, train_loader, val_loader, device,
                         epochs=25, lr=1e-4, pos_weights=None):
     """Recovery fine-tuning after GDGU parameter update."""
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-4)
+    params = [p for p in model.parameters() if p.requires_grad]
+    optimizer = torch.optim.Adam(params, lr=lr, weight_decay=1e-4)
     criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weights)
     best_metric = 0.0
     best_state = copy.deepcopy(model.state_dict())
@@ -59,7 +60,7 @@ def finetune_after_gdgu(model, train_loader, val_loader, device,
             out = model(batch)
             loss = criterion(out, batch.y)
             loss.backward()
-            nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
+            nn.utils.clip_grad_norm_(params, max_norm=5.0)
             optimizer.step()
 
         # Val check — macro ROC-AUC

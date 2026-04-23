@@ -162,6 +162,87 @@ def evaluate_model(model, loader, device):
     }
 
 
+# ======================================================================
+#  V6.0 Route A: joint training (loc + aux attack-type) + aux eval
+# ======================================================================
+
+def train_model_joint(model, train_loader, val_loader, device,
+                      epochs=200, lr=5e-4, weight_decay=1e-4, patience=30,
+                      pos_weights=None, type_weights=None, gamma=0.5,
+                      verbose=False, scheduler_patience=20):
+    """Joint training: L = BCE(loc) + gamma * CE(attack_type).
+
+    model must expose forward_both(data) -> (loc_logits, type_logits).
+    Monitors val macro-ROC on localization for early stopping.
+    """
+    from torch.optim.lr_scheduler import ReduceLROnPlateau
+
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
+    scheduler = ReduceLROnPlateau(optimizer, mode='max', factor=0.5,
+                                  patience=scheduler_patience)
+    crit_loc = nn.BCEWithLogitsLoss(pos_weight=pos_weights)
+    crit_type = nn.CrossEntropyLoss(
+        weight=type_weights) if type_weights is not None else nn.CrossEntropyLoss()
+
+    best_metric = 0.0
+    best_state = None
+    wait = 0
+    epoch_logs = []
+
+    for epoch in range(1, epochs + 1):
+        model.train()
+        total_loss = 0.0
+        n_batches = 0
+        for batch in train_loader:
+            batch = batch.to(device)
+            optimizer.zero_grad()
+            loc_logits, type_logits = model.forward_both(batch)
+            loss = crit_loc(loc_logits, batch.y) + gamma * crit_type(
+                type_logits, batch.y_type.view(-1))
+            loss.backward()
+            nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
+            optimizer.step()
+            total_loss += loss.item()
+            n_batches += 1
+
+        val_metric = _compute_val_roc(model, val_loader, device)
+        scheduler.step(val_metric)
+        epoch_logs.append({
+            'epoch': epoch,
+            'train_loss': round(total_loss / max(n_batches, 1), 6),
+            'val_roc': round(val_metric, 6),
+        })
+
+        if val_metric > best_metric:
+            best_metric = val_metric
+            best_state = copy.deepcopy(model.state_dict())
+            wait = 0
+        else:
+            wait += 1
+            if wait >= patience:
+                if verbose:
+                    print(f"  Early stop at epoch {epoch}, best val macro-ROC={best_metric:.4f}")
+                break
+
+    if best_state is not None:
+        model.load_state_dict(best_state)
+    return model, best_metric, epoch_logs
+
+
+@torch.no_grad()
+def evaluate_aux_acc(model, loader, device):
+    """Attack-type auxiliary head accuracy (5-way)."""
+    model.eval()
+    correct, total = 0, 0
+    for batch in loader:
+        batch = batch.to(device)
+        logits = model.forward_aux(batch)
+        preds = logits.argmax(dim=-1)
+        correct += (preds == batch.y_type.view(-1)).sum().item()
+        total += batch.y_type.size(0)
+    return correct / max(total, 1)
+
+
 def compute_mia_auc(model, member_loader, non_member_loader, device,
                     pos_weights=None, forget_label_idx=None):
     """Loss-based MIA for multi-label, split by forget/retain labels.

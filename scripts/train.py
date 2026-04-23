@@ -9,6 +9,7 @@ Usage:
     python train.py --bus 34bus
     python train.py --bus 123bus
     python train.py --bus 34bus --backbone GCN --scenario S1 --seed 42
+    python train.py --bus 34bus --route A          # V6.0 Route A
 """
 
 import argparse
@@ -29,8 +30,8 @@ CONFIG_DIR = PROJECT_ROOT / 'config'
 
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from src.data import load_evcs_data, expand_forget_khop
-from src.experiment import run_single_trial, run_single_trial_dual
+from src.data import load_evcs_data, expand_forget_khop, augment_route_a
+from src.experiment import run_single_trial, run_single_trial_dual, run_single_trial_route_a
 from src.models import MODEL_CLASSES
 
 
@@ -54,6 +55,7 @@ def load_experiment(bus_system: str, source_data: Path) -> dict:
     gi = cfg.get('gif', {})
     e = cfg['experiment']
     dc = cfg.get('dual_channel', {})
+    ra = cfg.get('route_a', {})
 
     # Resolve pkl_paths: support glob patterns (123-bus) and plain filenames
     raw_paths = d['pkl_paths']
@@ -96,13 +98,21 @@ def load_experiment(bus_system: str, source_data: Path) -> dict:
             'seeds':              e['seeds'],
             'backbones':          e['backbones'],
             'k_hops':             e.get('k_hops', [0]),
-            # ── dual-channel (Scheme A) ──
+            # ── dual-channel (V5.0 archived) ──
             'dual_channel': {
                 'graph_feat_dim':   dc.get('graph_feat_dim', 120),
                 'graph_mlp_hidden': dc.get('graph_mlp_hidden', 64),
                 'graph_mlp_out':    dc.get('graph_mlp_out', 32),
                 'alpha':            dc.get('alpha', 1.0),
                 'beta':             dc.get('beta', 1.0),
+            },
+            # ── route_a (V6.0) ──
+            'route_a': {
+                'gamma':          ra.get('gamma', 0.5),
+                'n_attack_types': ra.get('n_attack_types', 5),
+                'aux_hidden':     ra.get('aux_hidden', 64),
+                'ig_steps':       ra.get('ig_steps', 50),
+                'lr_gat':         ra.get('lr_gat', 1e-4),
             },
         },
     }
@@ -146,6 +156,26 @@ def build_scenarios(evcs_bus_ids, evcs_buses, n_nodes, edge_index, k_hops=None):
     return scenarios
 
 
+def build_scenarios_route_a(evcs_bus_ids, evcs_node_indices):
+    """Build cumulative unlearning scenarios for Route A (no k-hop).
+
+    Naming: S{n}, e.g. S1, S2, S3.
+    """
+    scenarios = {}
+    for i in range(1, len(evcs_bus_ids) + 1):
+        forget_buses = evcs_bus_ids[:i]
+        forget_nodes = evcs_node_indices[:i]
+        names_str = '+'.join(str(b) for b in forget_buses)
+        scen_key = f'S{i}'
+        scenarios[scen_key] = {
+            'label': f'S{i}: Bus {names_str} ({i} EVCS, P zeroed)',
+            'forget_node_indices': forget_nodes,
+            'forget_label_indices': list(range(i)),
+            'n_evcs_forget': i,
+        }
+    return scenarios
+
+
 def save_results(results_all, all_logs, bus_system, data, config,
                  scenarios, backbones, output_dir, device, tag):
     """Save CSV + JSON results to output_dir."""
@@ -162,13 +192,16 @@ def save_results(results_all, all_logs, bus_system, data, config,
     metric_cols = ['ExMatch', 'Hamming_Acc', 'Macro_ROC', 'Macro_F1'] \
                 + roc_cols + f1_cols \
                 + ['F1_forget', 'F1_retain', 'ROC_forget', 'ROC_retain'] \
-                + ['MIA_forget', 'MIA_retain', 'MIA_AUC', 'Time', 'Peak_Memory_MB']
+                + ['MIA_forget', 'MIA_retain', 'MIA_AUC', 'Time', 'Peak_Memory_MB'] \
+                + ['Aux_Acc', 'L2a_IG_mean', 'L2a_IG_std',
+                   'L2b_delta_auc', 'L2b_auc_P_present', 'L2b_auc_P_occluded']
+    metric_cols = [c for c in metric_cols if c in df.columns]
     summary = df.groupby(['Backbone', 'Scenario', 'Method'])[metric_cols].agg(['mean', 'std']).round(4)
     sum_csv = output_dir / f'{tag}_results_summary.csv'
     summary.to_csv(sum_csv)
     print(f'Summary saved to {sum_csv}')
 
-    # ── Epoch logs JSON (with metadata, same format as run_experiments.py) ──
+    # ── Epoch logs JSON (with metadata) ──
     meta = {
         'bus_system': bus_system,
         'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
@@ -205,14 +238,19 @@ def save_results(results_all, all_logs, bus_system, data, config,
                 sub = df[(df.Backbone == bb) & (df.Scenario == scen) & (df.Method == method)]
                 if len(sub) == 0:
                     continue
-                em = f"{sub['ExMatch'].mean():.3f}\u00b1{sub['ExMatch'].std():.3f}"
-                mr = f"{sub['Macro_ROC'].mean():.3f}\u00b1{sub['Macro_ROC'].std():.3f}"
-                mf = f"{sub['Macro_F1'].mean():.3f}\u00b1{sub['Macro_F1'].std():.3f}"
-                mia_f = f"{sub['MIA_forget'].mean():.3f}" if sub['MIA_forget'].notna().any() else '\u2014'
-                mia_r = f"{sub['MIA_retain'].mean():.3f}" if sub['MIA_retain'].notna().any() else '\u2014'
+                em = f"{sub['ExMatch'].mean():.3f}±{sub['ExMatch'].std():.3f}"
+                mr = f"{sub['Macro_ROC'].mean():.3f}±{sub['Macro_ROC'].std():.3f}"
+                mf = f"{sub['Macro_F1'].mean():.3f}±{sub['Macro_F1'].std():.3f}"
+                mia_f = f"{sub['MIA_forget'].mean():.3f}" if sub['MIA_forget'].notna().any() else '—'
+                mia_r = f"{sub['MIA_retain'].mean():.3f}" if sub['MIA_retain'].notna().any() else '—'
                 t = f"{sub['Time'].mean():.1f}s"
-                print(f'    {method:10s}  ExMatch={em}  MacroROC={mr}  MacroF1={mf}  '
-                      f'MIA_f={mia_f}  MIA_r={mia_r}  Time={t}')
+                line = (f'    {method:10s}  ExMatch={em}  MacroROC={mr}  MacroF1={mf}  '
+                        f'MIA_f={mia_f}  MIA_r={mia_r}  Time={t}')
+                if 'Aux_Acc' in sub.columns and sub['Aux_Acc'].notna().any():
+                    line += f"  AuxAcc={sub['Aux_Acc'].mean():.3f}"
+                if 'L2b_delta_auc' in sub.columns and sub['L2b_delta_auc'].notna().any():
+                    line += f"  L2b={sub['L2b_delta_auc'].mean():.4f}"
+                print(line)
 
     return df
 
@@ -224,7 +262,7 @@ def main():
     parser.add_argument('--backbone', type=str, default=None,
                         help='Single backbone to run (GCN/GAT/GIN). Default: all three')
     parser.add_argument('--scenario', type=str, default=None,
-                        help='Single scenario to run (S1-0/S2-1/...). Default: all')
+                        help='Single scenario to run (S1/S2/S1-0/...). Default: all')
     parser.add_argument('--khop', type=int, default=None,
                         help='Single k-hop value to run (0/1/2). Default: all from config')
     parser.add_argument('--seed', type=int, default=None,
@@ -237,9 +275,18 @@ def main():
     parser.add_argument('--gpu', type=int, default=1,
                         help='GPU device index (default: 1)')
     parser.add_argument('--dual', action='store_true',
-                        help='Use dual-channel model (Scheme A). '
-                             'Runs Original + GDGU + GIF + IDEA + Retrain (V5.1).')
+                        help='Use dual-channel model (V5.0 archived). '
+                             'Runs Original + GDGU + GIF + IDEA + Retrain.')
+    parser.add_argument('--route', type=str, default='A', choices=['A'],
+                        help='V6.0 Route A (default): single-head + aux attack-type head, '
+                             'modality-level unlearning (P-channel only). '
+                             'Use --no-route for legacy V2.0 pipeline.')
+    parser.add_argument('--no-route', dest='route', action='store_const', const=None,
+                        help='Disable Route A; use legacy V2.0 pipeline.')
     args = parser.parse_args()
+
+    if args.dual and args.route:
+        parser.error('--dual and --route are mutually exclusive')
 
     # Device
     device = torch.device(f'cuda:{args.gpu}' if torch.cuda.is_available() else 'cpu')
@@ -271,17 +318,21 @@ def main():
     data = load_evcs_data(exp['pkl_paths'], exp['gml_path'], bus_system=bus_system)
     config['out_dim'] = data['n_evcs']
 
-    # k-hop values: CLI override or config
-    k_hops = [args.khop] if args.khop is not None else config.get('k_hops', [0])
+    # ── Route A (V6.0) ──
+    if args.route == 'A':
+        data = augment_route_a(data, exp['pkl_paths'])
+        scenarios = build_scenarios_route_a(exp['evcs_bus_ids'],
+                                             data['evcs_node_indices'])
+    else:
+        # k-hop values: CLI override or config
+        k_hops = [args.khop] if args.khop is not None else config.get('k_hops', [0])
+        scenarios = build_scenarios(exp['evcs_bus_ids'], data['evcs_buses'],
+                                    data['n_nodes'], data['edge_index'], k_hops=k_hops)
 
-    # Scenarios (with k-hop expansion)
-    scenarios = build_scenarios(exp['evcs_bus_ids'], data['evcs_buses'],
-                                data['n_nodes'], data['edge_index'], k_hops=k_hops)
-
-    # Print forget-set sizes
+    # Print scenario summary
     print(f'\nScenarios ({len(scenarios)}):')
     for sk, sv in scenarios.items():
-        print(f'  {sk:8s}  forget={len(sv["forget_indices"])} nodes  {sv["label"]}')
+        print(f'  {sk:8s}  {sv["label"]}')
 
     # Filter by CLI args
     backbones = [args.backbone] if args.backbone else config['backbones']
@@ -305,7 +356,11 @@ def main():
             for seed in seeds:
                 count += 1
                 print(f'\n[{count}/{total}]')
-                if args.dual:
+                if args.route == 'A':
+                    trial_results, trial_logs = run_single_trial_route_a(
+                        backbone, scen_key, scen_val, seed,
+                        data, config, device)
+                elif args.dual:
                     trial_results, trial_logs = run_single_trial_dual(
                         backbone, scen_key, scen_val, seed,
                         data['all_x'], data['all_V'], data['all_y'],
@@ -327,7 +382,9 @@ def main():
 
     # Tag for partial runs
     tag = bus_system
-    if args.dual:
+    if args.route == 'A':
+        tag += '_routeA'
+    elif args.dual:
         tag += '_dual'
     if args.backbone:
         tag += f'_{args.backbone}'
@@ -339,7 +396,10 @@ def main():
                  scen_filter, backbones, output_dir, device, tag)
 
     print(f'\nAll outputs in: {output_dir}')
-    print(f'Visualize via:  notebooks/Viz_GDGU_loc.ipynb')
+    if args.route == 'A':
+        print(f'Visualize via:  notebooks/Viz_V6.ipynb')
+    else:
+        print(f'Visualize via:  notebooks/Viz_GDGU_loc.ipynb')
 
 
 if __name__ == '__main__':
