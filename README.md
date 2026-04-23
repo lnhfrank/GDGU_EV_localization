@@ -67,7 +67,7 @@ Unlearning is therefore **modality-level**: only the $P$-channel at the revoking
 Python 3.10, CUDA 12.1.
 
 ```bash
-conda create -n evcs_gnn python=3.10 -y && conda activate evcs_gnn
+conda create -n torch-gpu python=3.10 -y && conda activate torch-gpu
 
 pip install torch==2.5.1+cu121 --index-url https://download.pytorch.org/whl/cu121
 
@@ -115,8 +115,8 @@ $V$ from 3-phase-mean bus voltage (all nodes); $P$ from EVCS charging power seri
 ## Quick Start
 
 ```bash
-conda activate evcs_gnn
-cd Projects/4-GU_EV_loc
+conda activate torch-gpu
+cd ~/1P_WTT_NVD/Projects/4-GU_EV_loc
 
 # V6.0 Route A — default
 python scripts/train.py --bus 34bus                    # cuda:1, all 3 backbones
