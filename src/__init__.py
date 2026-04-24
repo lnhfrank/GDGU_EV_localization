@@ -7,13 +7,13 @@ Public API:
     GCN_Graph, GAT_Graph, GIN_Graph, MODEL_CLASSES, AuxWrapper
 
   Data
-    load_evcs_data, build_graphs, build_graphs_route_a,
-    augment_route_a, expand_forget_khop,
+    load_evcs_data, build_graphs_route_a,
+    augment_route_a,
     stratified_split_multilabel, fit_scaler,
     EVCS_PRESETS
 
   Training
-    train_model, train_model_joint,
+    train_model_joint,
     evaluate_model, evaluate_aux_acc,
     compute_mia_auc, get_pos_weights,
     kaiming_init, save_checkpoint
@@ -25,31 +25,28 @@ Public API:
     recalibrate_batchnorm,
     finetune_after_gdgu
 
-  Privacy (V6.0)
+  Privacy
     L2_a_integrated_gradients, L2_b_occlusion_delta_auc,
     L2_c_reconstruction, L2_e_attack_type_inference,
     extract_graph_embeddings, derive_det_from_loc,
     measure_unlearn_efficiency
 
   Experiment
-    run_single_trial, run_single_trial_route_a
+    run_single_trial_route_a
 """
 
 from .models import GCN_Graph, GAT_Graph, GIN_Graph, MODEL_CLASSES, AuxWrapper
 
 from .data import (
     load_evcs_data,
-    build_graphs,
     build_graphs_route_a,
     augment_route_a,
-    expand_forget_khop,
     stratified_split_multilabel,
     fit_scaler,
     EVCS_PRESETS,
 )
 
 from .training import (
-    train_model,
     train_model_joint,
     evaluate_model,
     evaluate_aux_acc,
@@ -78,17 +75,17 @@ from .privacy import (
     measure_unlearn_efficiency,
 )
 
-from .experiment import run_single_trial, run_single_trial_route_a
+from .experiment import run_single_trial_route_a
 
 __all__ = [
     # Models
     "GCN_Graph", "GAT_Graph", "GIN_Graph", "MODEL_CLASSES", "AuxWrapper",
     # Data
-    "load_evcs_data", "build_graphs", "build_graphs_route_a",
-    "augment_route_a", "expand_forget_khop",
+    "load_evcs_data", "build_graphs_route_a",
+    "augment_route_a",
     "stratified_split_multilabel", "fit_scaler", "EVCS_PRESETS",
     # Training
-    "train_model", "train_model_joint",
+    "train_model_joint",
     "evaluate_model", "evaluate_aux_acc",
     "compute_mia_auc", "get_pos_weights",
     "kaiming_init", "save_checkpoint",
@@ -101,5 +98,5 @@ __all__ = [
     "extract_graph_embeddings", "derive_det_from_loc",
     "measure_unlearn_efficiency",
     # Experiment
-    "run_single_trial", "run_single_trial_route_a",
+    "run_single_trial_route_a",
 ]

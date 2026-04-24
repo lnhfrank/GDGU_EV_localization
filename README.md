@@ -117,6 +117,7 @@ $V$ from 3-phase-mean bus voltage (all nodes); $P$ from EVCS charging power seri
 ```bash
 conda activate torch-gpu
 cd ~/1P_WTT_NVD/Projects/4-GU_EV_loc
+tmux new -s exp34
 
 python scripts/train.py --bus 34bus                    # cuda:1, all 3 backbones
 python scripts/train.py --bus 123bus --gpu 0           # cuda:0 (RTX 4090 #0)
