@@ -1,15 +1,14 @@
 #!/usr/bin/env python3
 """Non-interactive training script for HPC batch jobs.
 
-Hyperparameters are loaded from config/<bus_system>.yaml (same as run_experiments.py).
+Hyperparameters are loaded from config/<bus_system>.yaml.
 All outputs (CSV, JSON logs) are saved to results/<YYYY-MM-DD_HH>/.
-Visualization is handled separately via notebooks/Viz_GDGU_loc.ipynb.
+Visualization is handled separately via notebooks/Viz_V6.ipynb.
 
 Usage:
     python train.py --bus 34bus
-    python train.py --bus 123bus
-    python train.py --bus 34bus --backbone GCN --scenario S1 --seed 42
-    python train.py --bus 34bus --route A          # V6.0 Route A
+    python train.py --bus 123bus --gpu 0
+    python train.py --bus 34bus --backbone GAT
 """
 
 import argparse
@@ -30,16 +29,13 @@ CONFIG_DIR = PROJECT_ROOT / 'config'
 
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from src.data import load_evcs_data, expand_forget_khop, augment_route_a
-from src.experiment import run_single_trial, run_single_trial_dual, run_single_trial_route_a
+from src.data import load_evcs_data, augment_route_a
+from src.experiment import run_single_trial_route_a
 from src.models import MODEL_CLASSES
 
 
 def load_experiment(bus_system: str, source_data: Path) -> dict:
-    """Load experiment definition from config/<bus_system>.yaml.
-
-    Same logic as run_experiments.py to guarantee parameter consistency.
-    """
+    """Load experiment definition from config/<bus_system>.yaml."""
     cfg_path = CONFIG_DIR / f'{bus_system}.yaml'
     if not cfg_path.exists():
         raise FileNotFoundError(
@@ -54,7 +50,6 @@ def load_experiment(bus_system: str, source_data: Path) -> dict:
     g = cfg['gdgu']
     gi = cfg.get('gif', {})
     e = cfg['experiment']
-    dc = cfg.get('dual_channel', {})
     ra = cfg.get('route_a', {})
 
     # Resolve pkl_paths: support glob patterns (123-bus) and plain filenames
@@ -97,67 +92,19 @@ def load_experiment(bus_system: str, source_data: Path) -> dict:
             # ── experiment ──
             'seeds':              e['seeds'],
             'backbones':          e['backbones'],
-            'k_hops':             e.get('k_hops', [0]),
-            # ── dual-channel (V5.0 archived) ──
-            'dual_channel': {
-                'graph_feat_dim':   dc.get('graph_feat_dim', 120),
-                'graph_mlp_hidden': dc.get('graph_mlp_hidden', 64),
-                'graph_mlp_out':    dc.get('graph_mlp_out', 32),
-                'alpha':            dc.get('alpha', 1.0),
-                'beta':             dc.get('beta', 1.0),
-            },
             # ── route_a (V6.0) ──
             'route_a': {
                 'gamma':          ra.get('gamma', 0.5),
                 'n_attack_types': ra.get('n_attack_types', 5),
                 'aux_hidden':     ra.get('aux_hidden', 64),
                 'ig_steps':       ra.get('ig_steps', 50),
-                'lr_gat':         ra.get('lr_gat', 1e-4),
             },
         },
     }
 
 
-def build_scenarios(evcs_bus_ids, evcs_buses, n_nodes, edge_index, k_hops=None):
-    """Build cumulative unlearning scenarios with k-hop neighbor expansion.
-
-    Naming: S{n}-{k}, e.g. S1-0 (EVCS only), S1-1 (+1-hop neighbors), S1-2 (+2-hop).
-
-    Args:
-        evcs_bus_ids: list of EVCS bus IDs in cumulative forget order.
-        evcs_buses:   dict {bus_id: node_index}.
-        n_nodes:      total number of nodes in the graph.
-        edge_index:   [2, E] tensor for topology.
-        k_hops:       list of k values, e.g. [0, 1, 2]. Defaults to [0].
-    """
-    if k_hops is None:
-        k_hops = [0]
-
-    scenarios = {}
-    for i in range(1, len(evcs_bus_ids) + 1):
-        forget_buses = evcs_bus_ids[:i]
-        evcs_indices = [evcs_buses[b] for b in forget_buses]
-        names_str = '+'.join(str(b) for b in forget_buses)
-
-        for k in k_hops:
-            expanded = expand_forget_khop(evcs_indices, edge_index, k=k)
-            n_forget = len(expanded)
-            pct = n_forget / n_nodes * 100
-            scen_key = f'S{i}-{k}'
-            scenarios[scen_key] = {
-                'label': f'S{i}-{k}: Bus {names_str} '
-                         f'(k={k}, {n_forget} node{"s" if n_forget > 1 else ""}, {pct:.1f}%)',
-                'forget_indices': expanded,
-                'forget_label_indices': list(range(i)),
-                'evcs_indices': evcs_indices,
-                'k_hop': k,
-                'n_evcs_forget': i,
-            }
-    return scenarios
-
-
 def build_scenarios_route_a(evcs_bus_ids, evcs_node_indices):
-    """Build cumulative unlearning scenarios for Route A (no k-hop).
+    """Build cumulative unlearning scenarios for Route A.
 
     Naming: S{n}, e.g. S1, S2, S3.
     """
@@ -262,9 +209,7 @@ def main():
     parser.add_argument('--backbone', type=str, default=None,
                         help='Single backbone to run (GCN/GAT/GIN). Default: all three')
     parser.add_argument('--scenario', type=str, default=None,
-                        help='Single scenario to run (S1/S2/S1-0/...). Default: all')
-    parser.add_argument('--khop', type=int, default=None,
-                        help='Single k-hop value to run (0/1/2). Default: all from config')
+                        help='Single scenario to run (S1/S2/...). Default: all')
     parser.add_argument('--seed', type=int, default=None,
                         help='Single seed to run. Default: all seeds from config')
     parser.add_argument('--seeds', type=int, nargs='+', default=None,
@@ -274,19 +219,7 @@ def main():
                         help='Override source data directory')
     parser.add_argument('--gpu', type=int, default=1,
                         help='GPU device index (default: 1)')
-    parser.add_argument('--dual', action='store_true',
-                        help='Use dual-channel model (V5.0 archived). '
-                             'Runs Original + GDGU + GIF + IDEA + Retrain.')
-    parser.add_argument('--route', type=str, default='A', choices=['A'],
-                        help='V6.0 Route A (default): single-head + aux attack-type head, '
-                             'modality-level unlearning (P-channel only). '
-                             'Use --no-route for legacy V2.0 pipeline.')
-    parser.add_argument('--no-route', dest='route', action='store_const', const=None,
-                        help='Disable Route A; use legacy V2.0 pipeline.')
     args = parser.parse_args()
-
-    if args.dual and args.route:
-        parser.error('--dual and --route are mutually exclusive')
 
     # Device
     device = torch.device(f'cuda:{args.gpu}' if torch.cuda.is_available() else 'cpu')
@@ -301,11 +234,11 @@ def main():
     else:
         source_data = PROJECT_ROOT.parent / 'Source' / 'PB_data' / '3_EVCS Attacks'
 
-    # Load config from YAML (same as run_experiments.py)
+    # Load config from YAML
     exp = load_experiment(bus_system, source_data)
     config = exp['config']
 
-    # Single output directory — everything goes here
+    # Single output directory
     today = datetime.now().strftime('%Y-%m-%d_%H')
     output_dir = PROJECT_ROOT / 'results' / today
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -318,16 +251,10 @@ def main():
     data = load_evcs_data(exp['pkl_paths'], exp['gml_path'], bus_system=bus_system)
     config['out_dim'] = data['n_evcs']
 
-    # ── Route A (V6.0) ──
-    if args.route == 'A':
-        data = augment_route_a(data, exp['pkl_paths'])
-        scenarios = build_scenarios_route_a(exp['evcs_bus_ids'],
-                                             data['evcs_node_indices'])
-    else:
-        # k-hop values: CLI override or config
-        k_hops = [args.khop] if args.khop is not None else config.get('k_hops', [0])
-        scenarios = build_scenarios(exp['evcs_bus_ids'], data['evcs_buses'],
-                                    data['n_nodes'], data['edge_index'], k_hops=k_hops)
+    # Route A augmentation
+    data = augment_route_a(data, exp['pkl_paths'])
+    scenarios = build_scenarios_route_a(exp['evcs_bus_ids'],
+                                         data['evcs_node_indices'])
 
     # Print scenario summary
     print(f'\nScenarios ({len(scenarios)}):')
@@ -356,20 +283,9 @@ def main():
             for seed in seeds:
                 count += 1
                 print(f'\n[{count}/{total}]')
-                if args.route == 'A':
-                    trial_results, trial_logs = run_single_trial_route_a(
-                        backbone, scen_key, scen_val, seed,
-                        data, config, device)
-                elif args.dual:
-                    trial_results, trial_logs = run_single_trial_dual(
-                        backbone, scen_key, scen_val, seed,
-                        data['all_x'], data['all_V'], data['all_y'],
-                        data['edge_index'], config, device)
-                else:
-                    trial_results, trial_logs = run_single_trial(
-                        backbone, scen_key, scen_val, seed,
-                        data['all_x'], data['all_y'], data['edge_index'],
-                        config, device)
+                trial_results, trial_logs = run_single_trial_route_a(
+                    backbone, scen_key, scen_val, seed,
+                    data, config, device)
                 results_all.extend(trial_results)
                 all_logs[f'{backbone}_{scen_key}_{seed}'] = trial_logs
                 print(f'  Finished at {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}')
@@ -381,25 +297,18 @@ def main():
     print(f'{"="*70}')
 
     # Tag for partial runs
-    tag = bus_system
-    if args.route == 'A':
-        tag += '_routeA'
-    elif args.dual:
-        tag += '_dual'
+    tag = f'{bus_system}_routeA'
     if args.backbone:
         tag += f'_{args.backbone}'
     if args.scenario:
         tag += f'_{args.scenario}'
 
-    # Save all outputs to the single date folder
+    # Save all outputs
     save_results(results_all, all_logs, bus_system, data, config,
                  scen_filter, backbones, output_dir, device, tag)
 
     print(f'\nAll outputs in: {output_dir}')
-    if args.route == 'A':
-        print(f'Visualize via:  notebooks/Viz_V6.ipynb')
-    else:
-        print(f'Visualize via:  notebooks/Viz_GDGU_loc.ipynb')
+    print(f'Visualize via:  notebooks/Viz_V6.ipynb')
 
 
 if __name__ == '__main__':

@@ -117,6 +117,7 @@ $V$ from 3-phase-mean bus voltage (all nodes); $P$ from EVCS charging power seri
 ```bash
 conda activate torch-gpu
 cd ~/1P_WTT_NVD/Projects/4-GU_EV_loc
+tmux new -s exp34
 
 python scripts/train.py --bus 34bus                    # cuda:1, all 3 backbones
 python scripts/train.py --bus 123bus --gpu 0           # cuda:0 (RTX 4090 #0)
@@ -140,17 +141,19 @@ Outputs saved automatically to `results/YYYY-MM-DD_HH/`. Then open `notebooks/Vi
 
 | Parameter | Value |
 |---|---|
-| Split | 80 / 10 / 10 (stratified by multi-label hash) |
+| Split | 70 / 15 / 15 (stratified by multi-label hash) |
+| Batch size | 32 |
 | Epochs / patience | 300 / 50 (val Macro ROC-AUC) |
-| Hidden dim / layers | 128 / 3 |
-| Optimizer | Adam (lr=5e-4, wd=1e-4) + ReduceLROnPlateau (GAT lr=1e-4) |
-| Loss (joint) | BCE(loc) + γ·CE(attack_type), γ=1.0 |
+| Hidden dim / layers / dropout | 128 / 3 / 0.3 |
+| Optimizer | Adam (lr=5e-4, wd=1e-4) + ReduceLROnPlateau (scheduler_patience=20); GAT uses lr=1e-4 |
+| Loss (joint) | BCE(loc) + γ·CE(attack_type), γ=0.5 |
 | Seeds | 10 (42, 77, 88, 124, 137, 226, 347, 499, 666, 999) |
-| GDGU damp / max_norm / finetune | 0.1 / 1.0 / 25 epochs |
+| GDGU damp / max_norm / finetune | 0.1 / 1.0 / 25 epochs (finetune_lr=1e-4) |
 | GIF iterations / damp / scale | 50 / 0.01 / 50.0 |
+| IDEA finetune | 25 epochs |
 | `max_batches` (34 / 123-bus) | 22 / 30 (HVP sub-sampling to avoid OOM) |
 | Aux head hidden / n_types | 64 / 5 |
-| IG steps | 20 |
+| IG steps | 50 |
 
 ---
 

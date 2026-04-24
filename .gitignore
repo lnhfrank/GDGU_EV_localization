@@ -15,3 +15,4 @@ scripts/*.sbatch
 notebooks/GDGU_EV_loc_*.ipynb
 notebooks/Privacy_Radius_Analysis.ipynb
 scripts/smoke_A/
+scripts/smoke_test.py
